@@ -1,0 +1,73 @@
+"""Backend registry: maps short keys to a factory that builds a DepthBackend."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+from .base import BackendInfo, DepthBackend
+from .hf_pipeline import HFPipelineBackend
+from .metric3d import Metric3DBackend
+from .unidepth import UniDepthBackend
+
+WEIGHTS_ROOT = Path(__file__).parent.parent.parent / "weights"
+
+
+def _hf(key: str, repo: str, label: str | None = None,
+        infer_w: int = 640, infer_h: int = 480) -> Callable[[float], DepthBackend]:
+    info = BackendInfo(
+        key=key, label=label or key, family="hf-pipeline",
+        repo=repo, infer_w=infer_w, infer_h=infer_h,
+    )
+    return lambda focal_px: HFPipelineBackend(info, WEIGHTS_ROOT)
+
+
+def _unidepth(key: str, repo: str, label: str,
+              infer_w: int = 640, infer_h: int = 480) -> Callable[[float], DepthBackend]:
+    info = BackendInfo(
+        key=key, label=label, family="unidepth",
+        repo=repo, infer_w=infer_w, infer_h=infer_h,
+    )
+    return lambda focal_px: UniDepthBackend(info)
+
+
+def _metric3d(key: str, hub_entry: str, label: str,
+              infer_w: int = 640, infer_h: int = 480) -> Callable[[float], DepthBackend]:
+    info = BackendInfo(
+        key=key, label=label, family="metric3d",
+        repo=hub_entry, infer_w=infer_w, infer_h=infer_h,
+    )
+    return lambda focal_px: Metric3DBackend(info, hub_entry, focal_px=focal_px)
+
+
+# Registry: key -> factory(focal_px) -> DepthBackend
+BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
+    "dav2-indoor-small":   _hf("dav2-indoor-small",   "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"),
+    "dav2-indoor-base":    _hf("dav2-indoor-base",    "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"),
+    "dav2-indoor-large":   _hf("dav2-indoor-large",   "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"),
+    "dav2-outdoor-small":  _hf("dav2-outdoor-small",  "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"),
+    "dav2-outdoor-base":   _hf("dav2-outdoor-base",   "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"),
+    "dav2-outdoor-large":  _hf("dav2-outdoor-large",  "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf"),
+    "depthpro":            _hf("depthpro",            "apple/DepthPro-hf"),
+    "unidepth-v2-vitl14":  _unidepth("unidepth-v2-vitl14",
+                                     "lpiccinelli/unidepth-v2-vitl14",
+                                     "UniDepth V2 ViT-L/14"),
+    "metric3d-v2-small":   _metric3d("metric3d-v2-small",
+                                     "metric3d_vit_small",
+                                     "Metric3D V2 ViT-S"),
+    "metric3d-v2-large":   _metric3d("metric3d-v2-large",
+                                     "metric3d_vit_large",
+                                     "Metric3D V2 ViT-L"),
+}
+
+DEFAULT_MODEL = "dav2-indoor-small"
+
+
+def make_backend(key: str, focal_px: float) -> DepthBackend:
+    if key not in BACKENDS:
+        raise ValueError(f"Unknown backend key '{key}'. Available: {list(BACKENDS)}")
+    return BACKENDS[key](focal_px)
+
+
+__all__ = ["BACKENDS", "DEFAULT_MODEL", "make_backend",
+           "BackendInfo", "DepthBackend"]

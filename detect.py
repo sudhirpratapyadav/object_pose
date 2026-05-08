@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from camera import RealSenseRGB
-from depth  import create_shm, depth_worker, MODELS, DEFAULT_MODEL
+from depth  import create_shm, depth_worker, BACKENDS, DEFAULT_MODEL
 from viewer import Viewer
 
 VIZ_HZ = 30
@@ -76,12 +76,12 @@ def main():
     spawn_depth(DEFAULT_MODEL)
 
     viewer = Viewer(intr.width, intr.height, intr.fx, intr.fy, intr.cx, intr.cy,
-                    model_keys=list(MODELS.keys()), default_model=DEFAULT_MODEL)
+                    model_keys=list(BACKENDS.keys()), default_model=DEFAULT_MODEL)
 
     def on_model_change(key: str) -> None:
         if key == state["model"]:
             return
-        viewer.set_model_status(f"switching to {key} ...")
+        viewer.set_model_status(f"switching to {key} ...", "", "")
         stop_depth()
         with shm.pc_count.get_lock():
             shm.pc_count.value = 0
@@ -101,16 +101,18 @@ def main():
     n_rgb = n_depth = n_pc = 0
     t_log = time.time()
 
-    def _format_status(msg: tuple) -> str:
-        if not msg: return ""
+    def _format_status(msg: tuple) -> tuple[str, str, str]:
+        """Return (status, progress, filename) tuple for the GUI."""
+        if not msg: return ("", "", "")
         kind = msg[0]
         if kind == "downloading":
-            fname, pct = msg[1], msg[2]
-            return f"downloading {fname} ({pct:.0f}%)"
-        if kind == "loading": return "loading model ..."
-        if kind == "warming": return "warming up ..."
-        if kind == "ready":   return f"running {state['model']}"
-        return " ".join(str(m) for m in msg)
+            fname, progress = msg[1], msg[2]
+            return ("downloading", str(progress), fname)
+        if kind == "loading": return ("loading model ...", "", "")
+        if kind == "warming": return ("warming up ...", "", "")
+        if kind == "ready":   return (f"running {state['model']}", "", "")
+        if kind == "error":   return ("error", "", msg[1] if len(msg)>1 else "")
+        return (" ".join(str(m) for m in msg), "", "")
 
     try:
         while True:
@@ -144,7 +146,8 @@ def main():
                     try: latest = sq.get_nowait()
                     except Exception: break
                 if latest is not None:
-                    viewer.set_model_status(_format_status(latest))
+                    s, p, f = _format_status(latest)
+                    viewer.set_model_status(s, p, f)
 
             if time.time() - t_log >= 1.0:
                 dt = time.time() - t_log

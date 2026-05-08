@@ -17,7 +17,6 @@ def _depth_to_rgb(depth_m: np.ndarray) -> np.ndarray:
 def _frustum_segments(width: int, height: int,
                       fx: float, fy: float, cx: float, cy: float,
                       scale: float = 0.3) -> np.ndarray:
-    """10 line segments forming a camera-frame frustum: 4 rays + 4 edges + 2 diagonals."""
     corners = np.array([
         [(0     - cx) / fx * scale, (0      - cy) / fy * scale, scale],
         [(width - cx) / fx * scale, (0      - cy) / fy * scale, scale],
@@ -62,7 +61,6 @@ class Viewer:
             if self._pc_handle is not None:
                 self._pc_handle.point_size = self.sl_pc_size.value
 
-        # Depth model dropdown — selection is read by main loop
         self._on_model_change = None
         if model_keys:
             with self.server.gui.add_folder("Depth Model"):
@@ -73,16 +71,19 @@ class Viewer:
                 self.txt_model_status = self.server.gui.add_text(
                     "Status", initial_value="ready",
                 )
+                self.txt_model_progress = self.server.gui.add_text(
+                    "Progress", initial_value="",
+                )
+                self.txt_model_file = self.server.gui.add_text(
+                    "File", initial_value="",
+                )
 
             @self.dd_model.on_update
             def _(_):
                 if self._on_model_change is not None:
                     self._on_model_change(self.dd_model.value)
 
-        # Origin frame (world == camera frame for now)
         self.server.scene.add_frame("/origin", axes_length=0.15, axes_radius=0.005)
-
-        # Camera frustum at origin (camera is at origin, looking +Z)
         segs = _frustum_segments(width, height, fx, fy, cx, cy)
         self.server.scene.add_line_segments(
             "/camera_frustum",
@@ -113,9 +114,13 @@ class Viewer:
     def set_model_change_callback(self, fn) -> None:
         self._on_model_change = fn
 
-    def set_model_status(self, text: str) -> None:
+    def set_model_status(self, text: str, progress: str = "", filename: str = "") -> None:
         if hasattr(self, "txt_model_status"):
             self.txt_model_status.value = text
+        if hasattr(self, "txt_model_progress"):
+            self.txt_model_progress.value = progress
+        if hasattr(self, "txt_model_file"):
+            self.txt_model_file.value = filename
 
     def update_fps(self, rgb_fps: float, depth_fps: float, pc_fps: float) -> None:
         self.txt_rgb_fps.value   = f"{rgb_fps:.1f}"
