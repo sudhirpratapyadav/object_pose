@@ -11,6 +11,15 @@ export const KIND_POINTS = 0;
 export const KIND_MESH = 1;
 export const KIND_JPEG = 2;
 export const KIND_META = 3;
+export const KIND_DEPTH_JPEG = 4;
+export const KIND_MODEL_STATE = 5;
+
+export type ModelState = {
+  model: string;
+  status: string;
+  progress: string;
+  file: string;
+};
 
 export type Meta = {
   rgb_w: number; rgb_h: number;
@@ -19,6 +28,9 @@ export type Meta = {
   fx_infer: number; fy_infer: number; cx_infer: number; cy_infer: number;
   mesh_grid_w: number; mesh_grid_h: number;
   viz_hz: number;
+  models: string[];
+  default_model: string;
+  model_state?: ModelState;
 };
 
 export type PointsFrame = {
@@ -37,7 +49,7 @@ export type MeshFrame = {
 };
 
 export type JpegFrame = {
-  kind: typeof KIND_JPEG; seq: number;
+  kind: typeof KIND_JPEG | typeof KIND_DEPTH_JPEG; seq: number;
   w: number; h: number; bytes: Uint8Array;
 };
 
@@ -45,7 +57,11 @@ export type MetaFrame = {
   kind: typeof KIND_META; seq: number; meta: Meta;
 };
 
-export type Frame = PointsFrame | MeshFrame | JpegFrame | MetaFrame;
+export type ModelStateFrame = {
+  kind: typeof KIND_MODEL_STATE; seq: number; state: ModelState;
+};
+
+export type Frame = PointsFrame | MeshFrame | JpegFrame | MetaFrame | ModelStateFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -99,16 +115,23 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const faces = new Uint32Array(buf.slice(off, off + 12 * nf));
       return { kind: KIND_MESH, seq, xyz, rgb, faces, nv, nf };
     }
-    case KIND_JPEG: {
+    case KIND_JPEG:
+    case KIND_DEPTH_JPEG: {
       const w = dv.getUint16(off, true); off += 2;
       const h = dv.getUint16(off, true); off += 2;
       const bytes = new Uint8Array(buf, off);
-      return { kind: KIND_JPEG, seq, w, h, bytes };
+      return { kind: kind as typeof KIND_JPEG | typeof KIND_DEPTH_JPEG,
+               seq, w, h, bytes };
     }
     case KIND_META: {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
       const meta = JSON.parse(text) as Meta;
       return { kind: KIND_META, seq, meta };
+    }
+    case KIND_MODEL_STATE: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const ms = JSON.parse(text) as ModelState;
+      return { kind: KIND_MODEL_STATE, seq, state: ms };
     }
   }
   return null;

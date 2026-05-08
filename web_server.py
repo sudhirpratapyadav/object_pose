@@ -27,17 +27,19 @@ import numpy as np
 import websockets
 
 from camera import NetworkRGB, RealSenseRGB
-from depth import create_shm, depth_worker, DEFAULT_MODEL
+from depth import BACKENDS, create_shm, depth_worker, DEFAULT_MODEL
 
 VIZ_HZ = 30
 CAM_W, CAM_H, CAM_FPS = 1280, 720, 30
 INFER_W, INFER_H = 640, 480
 
 MAGIC = b"P3DF"
-KIND_POINTS = 0
-KIND_MESH   = 1
-KIND_JPEG   = 2
-KIND_META   = 3
+KIND_POINTS      = 0
+KIND_MESH        = 1
+KIND_JPEG        = 2  # rgb camera image
+KIND_META        = 3  # one-shot connect payload (intrinsics + model keys)
+KIND_DEPTH_JPEG  = 4  # turbo-colormapped depth image
+KIND_MODEL_STATE = 5  # current model + status text + progress
 
 
 def _pack_header(seq: int, kind: int) -> bytes:
@@ -69,16 +71,28 @@ def _frame_mesh(seq: int, xyz: np.ndarray, rgb: np.ndarray,
     )
 
 
-def _frame_jpeg(seq: int, bgr: np.ndarray, quality: int = 70) -> bytes:
+def _frame_jpeg(seq: int, bgr: np.ndarray, kind: int = KIND_JPEG,
+                quality: int = 70) -> bytes:
     h, w = bgr.shape[:2]
     ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return b""
-    return _pack_header(seq, KIND_JPEG) + struct.pack("<HH", w, h) + buf.tobytes()
+    return _pack_header(seq, kind) + struct.pack("<HH", w, h) + buf.tobytes()
 
 
 def _frame_meta(seq: int, payload: dict) -> bytes:
     return _pack_header(seq, KIND_META) + json.dumps(payload).encode("utf-8")
+
+
+def _frame_model_state(seq: int, payload: dict) -> bytes:
+    return _pack_header(seq, KIND_MODEL_STATE) + json.dumps(payload).encode("utf-8")
+
+
+def _depth_to_turbo_bgr(depth_m: np.ndarray, dmax: float = 6.0) -> np.ndarray:
+    """Colorize depth (meters) as a TURBO-mapped BGR uint8 image."""
+    d = np.clip(depth_m, 0.0, dmax)
+    u8 = (d / max(dmax, 1e-3) * 255.0).astype(np.uint8)
+    return cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
 
 
 class Hub:
@@ -114,13 +128,19 @@ class Hub:
             await self.remove(ws)
 
 
-async def handler(ws, hub: Hub, meta_payload: dict) -> None:
+async def handler(ws, hub: Hub, meta_payload: dict,
+                  on_set_model) -> None:
     await hub.add(ws)
     try:
-        # Send meta (intrinsics, dims) on connect
         await ws.send(_frame_meta(0, meta_payload))
-        async for _ in ws:
-            pass  # No client messages expected for now
+        async for msg in ws:
+            if isinstance(msg, str):
+                try:
+                    cmd = json.loads(msg)
+                except Exception:
+                    continue
+                if isinstance(cmd, dict) and "set_model" in cmd:
+                    await on_set_model(str(cmd["set_model"]))
     finally:
         await hub.remove(ws)
 
@@ -139,26 +159,8 @@ async def main_async(args) -> None:
 
     shm = create_shm(intr.width, intr.height, INFER_W, INFER_H)
 
-    stop_ev = mp.Event()
-    status_q = mp.Queue(maxsize=64)
-    proc = mp.Process(
-        target=depth_worker,
-        args=(
-            shm.rgb.name, shm.depth.name, shm.pc_xyz.name, shm.pc_rgb.name,
-            shm.mesh_xyz.name, shm.mesh_rgb.name, shm.mesh_faces.name,
-            shm.rgb_seq, shm.depth_seq, shm.pc_count,
-            shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
-            shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
-            fx_i, fy_i, cx_i, cy_i,
-            stop_ev,
-            status_q,
-            args.model,
-        ),
-        daemon=True,
-    )
-    proc.start()
-
     rgb_buf    = shm.rgb_arr()
+    depth_buf  = shm.depth_arr()
     pc_xyz     = shm.pc_xyz_arr()
     pc_rgb     = shm.pc_rgb_arr()
     mesh_xyz   = shm.mesh_xyz_arr()
@@ -172,20 +174,87 @@ async def main_async(args) -> None:
         "fx_infer": fx_i, "fy_infer": fy_i, "cx_infer": cx_i, "cy_infer": cy_i,
         "mesh_grid_w": shm.mesh_grid_w, "mesh_grid_h": shm.mesh_grid_h,
         "viz_hz": VIZ_HZ,
+        "models": list(BACKENDS.keys()),
+        "default_model": DEFAULT_MODEL,
     }
 
     hub = Hub()
+    state = {
+        "proc": None,
+        "stop_ev": None,
+        "status_q": None,
+        "model": args.model,
+        "model_status": "starting",
+        "model_progress": "",
+        "model_file": "",
+    }
+
+    def spawn_depth(model_key: str) -> None:
+        stop_ev  = mp.Event()
+        status_q = mp.Queue(maxsize=64)
+        proc = mp.Process(
+            target=depth_worker,
+            args=(
+                shm.rgb.name, shm.depth.name, shm.pc_xyz.name, shm.pc_rgb.name,
+                shm.mesh_xyz.name, shm.mesh_rgb.name, shm.mesh_faces.name,
+                shm.rgb_seq, shm.depth_seq, shm.pc_count,
+                shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
+                shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
+                fx_i, fy_i, cx_i, cy_i,
+                stop_ev, status_q, model_key,
+            ),
+            daemon=True,
+        )
+        proc.start()
+        state.update(proc=proc, stop_ev=stop_ev, status_q=status_q,
+                     model=model_key, model_status="loading",
+                     model_progress="", model_file="")
+
+    def stop_depth() -> None:
+        if state["stop_ev"] is not None:
+            state["stop_ev"].set()
+        if state["proc"] is not None:
+            state["proc"].join(timeout=10.0)
+            if state["proc"].is_alive():
+                state["proc"].terminate()
+        if state["status_q"] is not None:
+            while True:
+                try: state["status_q"].get_nowait()
+                except Exception: break
+
+    def make_model_state_payload() -> dict:
+        return {
+            "model": state["model"],
+            "status": state["model_status"],
+            "progress": state["model_progress"],
+            "file": state["model_file"],
+        }
+
+    async def on_set_model(key: str) -> None:
+        if key == state["model"] or key not in BACKENDS:
+            return
+        state.update(model_status=f"switching to {key} ...",
+                     model_progress="", model_file="")
+        await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
+        # Run blocking spawn/stop in a thread so we don't stall the loop.
+        await asyncio.to_thread(stop_depth)
+        with shm.pc_count.get_lock():
+            shm.pc_count.value = 0
+        await asyncio.to_thread(spawn_depth, key)
+        await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
+
+    spawn_depth(args.model)
 
     async def ws_loop():
         async with websockets.serve(
-            lambda ws: handler(ws, hub, meta_payload),
+            lambda ws: handler(ws, hub, {**meta_payload,
+                                         "model_state": make_model_state_payload()},
+                              on_set_model),
             args.host, args.port,
-            max_size=None,         # don't reject big binary frames
-            compression=None,      # binary already tight
-            ping_interval=20,
+            max_size=None, compression=None, ping_interval=20,
         ):
             print(f"[ws] listening on ws://{args.host}:{args.port}", flush=True)
-            await asyncio.Future()  # run forever
+            await asyncio.Future()
 
     async def stream_loop():
         period = 1.0 / VIZ_HZ
@@ -196,6 +265,34 @@ async def main_async(args) -> None:
 
         while True:
             t0 = time.time()
+
+            # Drain depth-worker status queue and broadcast.
+            sq = state["status_q"]
+            if sq is not None:
+                latest = None
+                while True:
+                    try: latest = sq.get_nowait()
+                    except Exception: break
+                if latest is not None:
+                    kind = latest[0] if latest else ""
+                    if kind == "downloading":
+                        fname, progress = latest[1], latest[2]
+                        state.update(model_status="downloading",
+                                     model_progress=str(progress),
+                                     model_file=str(fname))
+                    elif kind == "loading":
+                        state.update(model_status="loading", model_progress="",
+                                     model_file="")
+                    elif kind == "warming":
+                        state.update(model_status="warming up",
+                                     model_progress="", model_file="")
+                    elif kind == "ready":
+                        state.update(model_status=f"running {state['model']}",
+                                     model_progress="", model_file="")
+                    elif kind == "error":
+                        state.update(model_status="error", model_progress="",
+                                     model_file=latest[1] if len(latest) > 1 else "")
+                    await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
 
             rgb = cam.get()
             if rgb is not None:
@@ -223,6 +320,12 @@ async def main_async(args) -> None:
                                     mesh_faces.copy())
                     )
                     seq += 1
+                # Always send a colorized depth jpeg, even when pc is empty.
+                depth_bgr = _depth_to_turbo_bgr(depth_buf)
+                await hub.broadcast(
+                    _frame_jpeg(seq, depth_bgr, kind=KIND_DEPTH_JPEG, quality=80)
+                )
+                seq += 1
                 n_depth += 1
 
             if time.time() - t_log >= 1.0:
@@ -241,10 +344,7 @@ async def main_async(args) -> None:
     try:
         await asyncio.gather(ws_loop(), stream_loop())
     finally:
-        stop_ev.set()
-        proc.join(timeout=5.0)
-        if proc.is_alive():
-            proc.terminate()
+        stop_depth()
         cam.stop()
         shm.close()
         shm.unlink()

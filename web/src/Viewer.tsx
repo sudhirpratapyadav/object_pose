@@ -5,8 +5,8 @@ import { StreamState } from "./useStream";
 
 type Props = {
   stream: StreamState;
-  pointSize: number;          // base size in meters
-  depthSizeFactor: number;    // multiply by 1 + depth*factor for far-bigger points
+  pointSize: number;
+  inversePerspective: boolean;
   display: "points" | "mesh" | "both";
   showCamera: boolean;
 };
@@ -15,16 +15,18 @@ const POINT_VS = /* glsl */ `
 attribute vec3 color;
 varying vec3 vColor;
 uniform float uBaseSize;
-uniform float uDepthFactor;
 uniform float uPxPerMeter;
+uniform float uInversePerspective;   // 0 = perspective shrink, 1 = flat screen size
 void main() {
   vColor = color;
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
-  float depth = -mv.z;                      // camera looks down -Z in three.js
-  float worldSize = uBaseSize * (1.0 + max(depth, 0.0) * uDepthFactor);
+  float depth = max(-mv.z, 0.001);
   gl_Position = projectionMatrix * mv;
-  // size in pixels, falling off with depth (perspective-correct)
-  gl_PointSize = worldSize * uPxPerMeter / max(depth, 0.001);
+  // perspective:        gl_PointSize = uBaseSize * uPxPerMeter / depth
+  // inverse-perspective: gl_PointSize = uBaseSize * uPxPerMeter
+  // mix(...) lerps so the toggle is a single uniform.
+  float inv = uInversePerspective;
+  gl_PointSize = uBaseSize * uPxPerMeter * mix(1.0 / depth, 1.0, inv);
 }`;
 
 const POINT_FS = /* glsl */ `
@@ -35,10 +37,10 @@ void main() {
   gl_FragColor = vec4(vColor, 1.0);
 }`;
 
-export function Viewer({ stream, pointSize, depthSizeFactor, display, showCamera }: Props) {
+export function Viewer({ stream, pointSize, inversePerspective, display, showCamera }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const propsRef = useRef({ pointSize, depthSizeFactor, display, showCamera });
-  propsRef.current = { pointSize, depthSizeFactor, display, showCamera };
+  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera });
+  propsRef.current = { pointSize, inversePerspective, display, showCamera };
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -75,8 +77,8 @@ export function Viewer({ stream, pointSize, depthSizeFactor, display, showCamera
     pointsGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
     const uniforms = {
       uBaseSize: { value: pointSize },
-      uDepthFactor: { value: depthSizeFactor },
       uPxPerMeter: { value: container.clientHeight },
+      uInversePerspective: { value: inversePerspective ? 1.0 : 0.0 },
     };
     const pointsMat = new THREE.ShaderMaterial({
       uniforms,
@@ -137,7 +139,7 @@ export function Viewer({ stream, pointSize, depthSizeFactor, display, showCamera
       axes.visible = p.showCamera;
       frustum.visible = p.showCamera;
       uniforms.uBaseSize.value = p.pointSize;
-      uniforms.uDepthFactor.value = p.depthSizeFactor;
+      uniforms.uInversePerspective.value = p.inversePerspective ? 1.0 : 0.0;
 
       // Update points
       const pf = stream.pointsRef.current;

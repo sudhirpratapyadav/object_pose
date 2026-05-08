@@ -36,5 +36,10 @@ extras = ["timm>=0.9"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# mmcv's setup.py imports pkg_resources without declaring setuptools as a
+# build dependency.
+[tool.uv.extra-build-dependencies]
+mmcv = ["setuptools", "wheel"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["camera", "depth", "viewer"]
