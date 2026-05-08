@@ -13,28 +13,32 @@ type Props = {
 
 const POINT_VS = /* glsl */ `
 attribute vec3 color;
+attribute float mask;
 varying vec3 vColor;
+varying float vMask;
 uniform float uBaseSize;
 uniform float uPxPerMeter;
-uniform float uInversePerspective;   // 0 = perspective shrink, 1 = flat screen size
+uniform float uInversePerspective;
 void main() {
   vColor = color;
+  vMask = mask;
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   float depth = max(-mv.z, 0.001);
   gl_Position = projectionMatrix * mv;
-  // perspective:        gl_PointSize = uBaseSize * uPxPerMeter / depth
-  // inverse-perspective: gl_PointSize = uBaseSize * uPxPerMeter
-  // mix(...) lerps so the toggle is a single uniform.
   float inv = uInversePerspective;
   gl_PointSize = uBaseSize * uPxPerMeter * mix(1.0 / depth, 1.0, inv);
 }`;
 
 const POINT_FS = /* glsl */ `
 varying vec3 vColor;
+varying float vMask;
+uniform vec3 uHighlight;        // tint color for masked points
+uniform float uHighlightAmt;    // 0..1 mix
 void main() {
   vec2 p = gl_PointCoord - 0.5;
-  if (dot(p, p) > 0.25) discard;             // round splat
-  gl_FragColor = vec4(vColor, 1.0);
+  if (dot(p, p) > 0.25) discard;
+  vec3 c = mix(vColor, uHighlight, vMask * uHighlightAmt);
+  gl_FragColor = vec4(c, 1.0);
 }`;
 
 export function Viewer({ stream, pointSize, inversePerspective, display, showCamera }: Props) {
@@ -65,6 +69,12 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     // World axes at origin
     const axes = new THREE.AxesHelper(0.15);
     scene.add(axes);
+
+    // Bounding box for the segmented region.
+    const bbox = new THREE.Box3();
+    const bboxHelper = new THREE.Box3Helper(bbox, new THREE.Color(0xffaa33));
+    bboxHelper.visible = false;
+    scene.add(bboxHelper);
     // Camera frustum (placeholder; sized later when meta arrives)
     const frustumGeom = new THREE.BufferGeometry();
     const frustumMat = new THREE.LineBasicMaterial({ color: 0x33cc55 });
@@ -75,10 +85,13 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     const pointsGeom = new THREE.BufferGeometry();
     pointsGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
     pointsGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
+    pointsGeom.setAttribute("mask", new THREE.BufferAttribute(new Float32Array(0), 1));
     const uniforms = {
       uBaseSize: { value: pointSize },
       uPxPerMeter: { value: container.clientHeight },
       uInversePerspective: { value: inversePerspective ? 1.0 : 0.0 },
+      uHighlight: { value: new THREE.Color(0xffaa33) },
+      uHighlightAmt: { value: 0.85 },
     };
     const pointsMat = new THREE.ShaderMaterial({
       uniforms,
@@ -108,7 +121,7 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     };
     window.addEventListener("resize", onResize);
 
-    let lastPointsSeq = -1, lastMeshSeq = -1;
+    let lastPointsSeq = -1, lastMeshSeq = -1, lastMaskSeq = -1;
     let metaApplied = false;
 
     const animate = () => {
@@ -147,9 +160,26 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         lastPointsSeq = pf.seq;
         const colorsF = new Float32Array(pf.n * 3);
         for (let i = 0; i < pf.n * 3; i++) colorsF[i] = pf.rgb[i] / 255;
+        const maskF = new Float32Array(pf.n);
+        for (let i = 0; i < pf.n; i++) maskF[i] = pf.mask[i] ? 1.0 : 0.0;
         pointsGeom.setAttribute("position", new THREE.BufferAttribute(pf.xyz, 3));
         pointsGeom.setAttribute("color", new THREE.BufferAttribute(colorsF, 3));
+        pointsGeom.setAttribute("mask", new THREE.BufferAttribute(maskF, 1));
         pointsGeom.computeBoundingSphere();
+      }
+
+      // Update bbox from mask frames
+      const mr = stream.maskRef.current;
+      if (mr && mr.seq !== lastMaskSeq) {
+        lastMaskSeq = mr.seq;
+        if (mr.hasBox) {
+          bbox.min.set(mr.boxMin[0], mr.boxMin[1], mr.boxMin[2]);
+          bbox.max.set(mr.boxMax[0], mr.boxMax[1], mr.boxMax[2]);
+          bboxHelper.box = bbox;
+          bboxHelper.visible = true;
+        } else {
+          bboxHelper.visible = false;
+        }
       }
 
       // Update mesh
@@ -181,6 +211,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       meshGeom.dispose();
       frustumGeom.dispose();
       frustumMat.dispose();
+      bboxHelper.geometry.dispose();
+      (bboxHelper.material as THREE.LineBasicMaterial).dispose();
       container.removeChild(renderer.domElement);
     };
     // We intentionally only run this effect once; values are read via refs/closure

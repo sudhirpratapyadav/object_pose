@@ -13,11 +13,19 @@ export const KIND_JPEG = 2;
 export const KIND_META = 3;
 export const KIND_DEPTH_JPEG = 4;
 export const KIND_MODEL_STATE = 5;
+export const KIND_MASK = 6;
+export const KIND_SAM_STATE = 7;
 
 export type ModelState = {
   model: string;
   status: string;
   progress: string;
+  file: string;
+};
+
+export type SamState = {
+  model: string;
+  status: string;
   file: string;
 };
 
@@ -31,12 +39,16 @@ export type Meta = {
   models: string[];
   default_model: string;
   model_state?: ModelState;
+  sam_models: string[];
+  sam_default_model: string;
+  sam_state?: SamState;
 };
 
 export type PointsFrame = {
   kind: typeof KIND_POINTS; seq: number;
   xyz: Float16Array;       // length 3n  (Float16 stored, exposed as f16)
   rgb: Uint8Array;         // length 3n, [0..255]
+  mask: Uint8Array;        // length n, 0 or 1
   n: number;
 };
 
@@ -61,7 +73,21 @@ export type ModelStateFrame = {
   kind: typeof KIND_MODEL_STATE; seq: number; state: ModelState;
 };
 
-export type Frame = PointsFrame | MeshFrame | JpegFrame | MetaFrame | ModelStateFrame;
+export type SamStateFrame = {
+  kind: typeof KIND_SAM_STATE; seq: number; state: SamState;
+};
+
+export type MaskFrame = {
+  kind: typeof KIND_MASK; seq: number; maskSeq: number;
+  mask: Uint8Array;
+  hasBox: boolean;
+  boxMin: Float32Array;
+  boxMax: Float32Array;
+};
+
+export type Frame =
+  | PointsFrame | MeshFrame | JpegFrame | MetaFrame
+  | ModelStateFrame | SamStateFrame | MaskFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -101,8 +127,9 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const n = dv.getUint32(off, true); off += 4;
       const xyz = f16BytesToF32(buf, off, 3 * n) as unknown as Float16Array;
       off += 6 * n;
-      const rgb = new Uint8Array(buf, off, 3 * n);
-      return { kind: KIND_POINTS, seq, xyz, rgb, n };
+      const rgb = new Uint8Array(buf.slice(off, off + 3 * n)); off += 3 * n;
+      const mask = new Uint8Array(buf.slice(off, off + n)); off += n;
+      return { kind: KIND_POINTS, seq, xyz, rgb, mask, n };
     }
     case KIND_MESH: {
       const nv = dv.getUint32(off, true); off += 4;
@@ -132,6 +159,20 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
       const ms = JSON.parse(text) as ModelState;
       return { kind: KIND_MODEL_STATE, seq, state: ms };
+    }
+    case KIND_SAM_STATE: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const ms = JSON.parse(text) as SamState;
+      return { kind: KIND_SAM_STATE, seq, state: ms };
+    }
+    case KIND_MASK: {
+      const maskSeq = dv.getUint32(off, true); off += 4;
+      const n = dv.getUint32(off, true); off += 4;
+      const mask = new Uint8Array(buf.slice(off, off + n)); off += n;
+      const hasBox = dv.getUint8(off) !== 0; off += 1;
+      const boxMin = new Float32Array(buf.slice(off, off + 12)); off += 12;
+      const boxMax = new Float32Array(buf.slice(off, off + 12)); off += 12;
+      return { kind: KIND_MASK, seq, maskSeq, mask, hasBox, boxMin, boxMax };
     }
   }
   return null;

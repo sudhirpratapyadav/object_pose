@@ -35,6 +35,20 @@ export default function App() {
 
   const models = stream.meta?.models ?? [];
   const currentModel = stream.modelState?.model ?? stream.meta?.default_model ?? "";
+  const samModels = stream.meta?.sam_models ?? [];
+  const currentSamModel = stream.samState?.model ?? stream.meta?.sam_default_model ?? "";
+
+  const onRgbClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    if (!stream.meta) return;
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width;
+    const py = (e.clientY - rect.top) / rect.height;
+    // Click is sent in INFERENCE-frame pixels (matches backend convention).
+    const x = Math.round(px * stream.meta.infer_w);
+    const y = Math.round(py * stream.meta.infer_h);
+    stream.samClick(x, y);
+  };
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100%" }}>
@@ -99,9 +113,37 @@ export default function App() {
           </label>
         </Section>
 
-        <Section title="RGB">
+        <Section title="Segmentation (SAM2)">
+          <select
+            value={currentSamModel}
+            disabled={!samModels.length}
+            onChange={(e) => stream.setSamModel(e.target.value)}
+            style={{ width: "100%", padding: 4, background: "#11151a",
+                     color: "#e5e7eb", border: "1px solid #1f242b" }}
+          >
+            {samModels.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
+            {stream.samState ? renderSamStatus(stream.samState) : "—"}
+          </div>
+          <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>
+            Click anywhere on the RGB image to segment.
+          </div>
+          <button
+            onClick={() => stream.samClear()}
+            style={{ marginTop: 6, width: "100%", padding: 4,
+                     background: "#11151a", color: "#e5e7eb",
+                     border: "1px solid #1f242b", cursor: "pointer" }}
+          >
+            Clear selection
+          </button>
+        </Section>
+
+        <Section title="RGB (click to segment)">
           {imgUrl
-            ? <img src={imgUrl} style={{ width: "100%", display: "block" }} />
+            ? <img src={imgUrl} onClick={onRgbClick}
+                   style={{ width: "100%", display: "block",
+                            cursor: "crosshair" }} />
             : <div style={{ color: "#666" }}>—</div>}
         </Section>
 
@@ -137,6 +179,12 @@ function renderStatus(s: { status: string; progress: string; file: string }): st
     const pct = s.progress ? `${s.progress}%` : "";
     return `downloading ${s.file} ${pct}`.trim();
   }
+  if (s.status === "error") return `error: ${s.file}`;
+  return s.status;
+}
+
+function renderSamStatus(s: { status: string; file: string }): string {
+  if (s.status === "downloading") return `downloading ${s.file}`.trim();
   if (s.status === "error") return `error: ${s.file}`;
   return s.status;
 }

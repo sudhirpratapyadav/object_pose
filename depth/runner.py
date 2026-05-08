@@ -35,6 +35,7 @@ class DepthShm:
     depth:  shared_memory.SharedMemory
     pc_xyz: shared_memory.SharedMemory
     pc_rgb: shared_memory.SharedMemory
+    pc_grid_idx: shared_memory.SharedMemory
     mesh_xyz:   shared_memory.SharedMemory
     mesh_rgb:   shared_memory.SharedMemory
     mesh_faces: shared_memory.SharedMemory
@@ -62,6 +63,9 @@ class DepthShm:
     def pc_rgb_arr(self) -> np.ndarray:
         return np.ndarray((self.n_max, 3), dtype=np.uint8, buffer=self.pc_rgb.buf)
 
+    def pc_grid_idx_arr(self) -> np.ndarray:
+        return np.ndarray((self.n_max,), dtype=np.uint32, buffer=self.pc_grid_idx.buf)
+
     def mesh_xyz_arr(self) -> np.ndarray:
         n = self.mesh_grid_w * self.mesh_grid_h
         return np.ndarray((n, 3), dtype=np.float32, buffer=self.mesh_xyz.buf)
@@ -75,11 +79,13 @@ class DepthShm:
 
     def close(self):
         for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+                    self.pc_grid_idx,
                     self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
             shm.close()
 
     def unlink(self):
         for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+                    self.pc_grid_idx,
                     self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
             try: shm.unlink()
             except FileNotFoundError: pass
@@ -95,11 +101,13 @@ def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
     depth  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 4)
     pc_xyz = shared_memory.SharedMemory(create=True, size=n_max * 3 * 4)
     pc_rgb = shared_memory.SharedMemory(create=True, size=n_max * 3)
+    pc_grid_idx = shared_memory.SharedMemory(create=True, size=n_max * 4)
     mesh_xyz   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     mesh_rgb   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     mesh_faces = shared_memory.SharedMemory(create=True, size=n_faces * 3 * 4)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
+        pc_grid_idx=pc_grid_idx,
         mesh_xyz=mesh_xyz, mesh_rgb=mesh_rgb, mesh_faces=mesh_faces,
         rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
@@ -116,6 +124,7 @@ def _open_existing(name: str) -> shared_memory.SharedMemory:
 
 def depth_worker(
     rgb_name: str, depth_name: str, pc_xyz_name: str, pc_rgb_name: str,
+    pc_grid_idx_name: str,
     mesh_xyz_name: str, mesh_rgb_name: str, mesh_faces_name: str,
     rgb_seq, depth_seq, pc_count,
     rgb_w: int, rgb_h: int, infer_w: int, infer_h: int, n_max: int,
@@ -138,6 +147,7 @@ def depth_worker(
     depth_shm  = _open_existing(depth_name)
     pc_xyz_shm = _open_existing(pc_xyz_name)
     pc_rgb_shm = _open_existing(pc_rgb_name)
+    pc_grid_idx_shm = _open_existing(pc_grid_idx_name)
     mesh_xyz_shm   = _open_existing(mesh_xyz_name)
     mesh_rgb_shm   = _open_existing(mesh_rgb_name)
     mesh_faces_shm = _open_existing(mesh_faces_name)
@@ -146,12 +156,13 @@ def depth_worker(
     depth_arr  = np.ndarray((infer_h, infer_w), dtype=np.float32, buffer=depth_shm.buf)
     pc_xyz_arr = np.ndarray((n_max, 3),         dtype=np.float32, buffer=pc_xyz_shm.buf)
     pc_rgb_arr = np.ndarray((n_max, 3),         dtype=np.uint8,   buffer=pc_rgb_shm.buf)
+    pc_grid_idx_arr = np.ndarray((n_max,),      dtype=np.uint32,  buffer=pc_grid_idx_shm.buf)
     n_verts    = mesh_grid_w * mesh_grid_h
     mesh_xyz_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_xyz_shm.buf)
     mesh_rgb_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_rgb_shm.buf)
     mesh_faces_arr = np.ndarray((mesh_n_faces, 3),  dtype=np.int32,   buffer=mesh_faces_shm.buf)
 
-    all_shms = (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm,
+    all_shms = (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm, pc_grid_idx_shm,
                 mesh_xyz_shm, mesh_rgb_shm, mesh_faces_shm)
 
     try:
@@ -203,17 +214,22 @@ def depth_worker(
         # Back-project
         d_ds   = d[::ds, ::ds]
         rgb_ds = rgb_inf[::ds, ::ds]
+        h_ds, w_ds = d_ds.shape
         valid  = (d_ds > PC_MIN_M) & (d_ds < PC_MAX_M)
         zs = d_ds[valid]
         xs = x_norm[valid] * zs
         ys = y_norm[valid] * zs
         pts  = np.stack([xs, ys, zs], axis=1).astype(np.float32)
         cols = rgb_ds[valid].astype(np.uint8)
+        # Flat grid index per valid point. Mesh grid is the same as pc grid
+        # (PC_DOWNSAMPLE == MESH_DOWNSAMPLE), so this also indexes mesh verts.
+        flat_idx = np.flatnonzero(valid.ravel()).astype(np.uint32)
         n = min(len(pts), n_max)
 
         depth_arr[...] = d
         pc_xyz_arr[:n] = pts[:n]
         pc_rgb_arr[:n] = cols[:n]
+        pc_grid_idx_arr[:n] = flat_idx[:n]
 
         fill_mesh(
             d, rgb_inf,

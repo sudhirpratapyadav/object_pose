@@ -55,6 +55,7 @@ def main():
             target=depth_worker,
             args=(
                 shm.rgb.name, shm.depth.name, shm.pc_xyz.name, shm.pc_rgb.name,
+                shm.pc_grid_idx.name,
                 shm.mesh_xyz.name, shm.mesh_rgb.name, shm.mesh_faces.name,
                 shm.rgb_seq, shm.depth_seq, shm.pc_count,
                 shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,

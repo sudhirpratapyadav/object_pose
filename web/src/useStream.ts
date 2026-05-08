@@ -1,25 +1,40 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Frame, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MESH, KIND_META, KIND_MODEL_STATE,
-  KIND_POINTS, Meta, ModelState, parseFrame,
+  Frame, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH, KIND_META,
+  KIND_MODEL_STATE, KIND_POINTS, KIND_SAM_STATE, Meta, ModelState, SamState,
+  parseFrame,
 } from "./protocol";
 
 type JpegRef = React.MutableRefObject<{ blobUrl: string | null; seq: number }>;
 
+export type MaskData = {
+  mask: Uint8Array;
+  hasBox: boolean;
+  boxMin: Float32Array;
+  boxMax: Float32Array;
+  seq: number;
+};
+
 export type StreamState = {
   meta: Meta | null;
   modelState: ModelState | null;
-  pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; n: number; seq: number } | null>;
+  samState: SamState | null;
+  pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
   meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
   depthJpegRef: JpegRef;
+  maskRef: React.MutableRefObject<MaskData | null>;
   connected: boolean;
   setModel: (key: string) => void;
+  setSamModel: (key: string) => void;
+  samClick: (x: number, y: number) => void;
+  samClear: () => void;
 };
 
 export function useStream(url: string): StreamState {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [modelState, setModelState] = useState<ModelState | null>(null);
+  const [samState, setSamState] = useState<SamState | null>(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -27,6 +42,7 @@ export function useStream(url: string): StreamState {
   const meshRef = useRef<StreamState["meshRef"]["current"]>(null);
   const jpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
   const depthJpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
+  const maskRef = useRef<MaskData | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -57,14 +73,28 @@ export function useStream(url: string): StreamState {
           case KIND_META:
             setMeta(frame.meta);
             if (frame.meta.model_state) setModelState(frame.meta.model_state);
+            if (frame.meta.sam_state) setSamState(frame.meta.sam_state);
             break;
           case KIND_MODEL_STATE:
             setModelState(frame.state);
+            break;
+          case KIND_SAM_STATE:
+            setSamState(frame.state);
+            break;
+          case KIND_MASK:
+            maskRef.current = {
+              mask: frame.mask,
+              hasBox: frame.hasBox,
+              boxMin: frame.boxMin,
+              boxMax: frame.boxMax,
+              seq: frame.maskSeq,
+            };
             break;
           case KIND_POINTS:
             pointsRef.current = {
               xyz: frame.xyz as unknown as Float32Array,
               rgb: frame.rgb,
+              mask: frame.mask,
               n: frame.n,
               seq: frame.seq,
             };
@@ -95,12 +125,18 @@ export function useStream(url: string): StreamState {
     };
   }, [url]);
 
-  const setModel = useCallback((key: string) => {
+  const send = (obj: unknown) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ set_model: key }));
-    }
-  }, []);
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  };
+  const setModel = useCallback((key: string) => send({ set_model: key }), []);
+  const setSamModel = useCallback((key: string) => send({ set_sam_model: key }), []);
+  const samClick = useCallback((x: number, y: number) => send({ sam_click: { x, y } }), []);
+  const samClear = useCallback(() => send({ sam_clear: true }), []);
 
-  return { meta, modelState, pointsRef, meshRef, jpegRef, depthJpegRef, connected, setModel };
+  return {
+    meta, modelState, samState,
+    pointsRef, meshRef, jpegRef, depthJpegRef, maskRef,
+    connected, setModel, setSamModel, samClick, samClear,
+  };
 }
