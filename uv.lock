@@ -939,6 +939,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "viser" },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -959,6 +960,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.65" },
     { name = "transformers", specifier = ">=4.40" },
     { name = "viser", specifier = ">=0.2" },
+    { name = "websockets", specifier = ">=12" },
 ]
 provides-extras = ["extras"]
 

@@ -19,6 +19,7 @@ dependencies = [
     "huggingface-hub>=0.23",
     "tqdm>=4.65",
     "opencv-python>=4.8",
+    "websockets>=12",
 ]
 
 [project.optional-dependencies]
