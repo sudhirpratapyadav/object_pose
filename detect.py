@@ -11,12 +11,13 @@ Pipeline:
 
 from __future__ import annotations
 
+import argparse
 import multiprocessing as mp
 import time
 
 import numpy as np
 
-from camera import RealSenseRGB
+from camera import NetworkRGB, RealSenseRGB
 from depth  import create_shm, depth_worker, BACKENDS, DEFAULT_MODEL
 from viewer import Viewer
 
@@ -26,7 +27,15 @@ INFER_W, INFER_H = 640, 480
 
 
 def main():
-    cam = RealSenseRGB(width=CAM_W, height=CAM_H, fps=CAM_FPS)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--camera", default="realsense",
+                    help="'realsense' (default) or an HTTP URL like 'http://other-pc:8080'")
+    args = ap.parse_args()
+
+    if args.camera == "realsense":
+        cam = RealSenseRGB(width=CAM_W, height=CAM_H, fps=CAM_FPS)
+    else:
+        cam = NetworkRGB(args.camera)
     intr = cam.start()
 
     # Scale intrinsics from capture to inference resolution
