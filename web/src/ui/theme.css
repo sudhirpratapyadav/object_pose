@@ -65,10 +65,8 @@ select, input[type="range"], input[type="checkbox"] {
 }
 
 /* Slot positions — one place, predictable. */
-.slot-tl   { top: 12px; left: 12px;  width: 280px; }
-.slot-tr   { top: 56px; right: 12px; width: 340px; }
+.slot-tl   { top: 12px; left: 12px; bottom: 12px; width: 320px; }
 .slot-bl   { bottom: 12px; left: 12px; }
-.slot-tr-pills { top: 12px; right: 12px; }
 
 .card-header {
   display: flex;
@@ -119,16 +117,41 @@ select, input[type="range"], input[type="checkbox"] {
   flex-direction: column;
   gap: var(--gap);
   overflow: auto;
-  max-height: 80vh;
-  transition: max-height 0.18s ease, opacity 0.18s ease, padding 0.18s ease;
+  flex: 1 1 auto;
+  min-height: 0;
+  transition: opacity 0.18s ease, padding 0.18s ease;
+  /* Firefox */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+/* WebKit / Blink */
+.card-body::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.card-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.card-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  transition: background 0.15s;
+}
+.card-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+  background-clip: content-box;
+}
+.card-body::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 .card.collapsed .card-body {
-  max-height: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  opacity: 0;
-  overflow: hidden;
+  display: none;
+}
+.card.collapsed {
+  bottom: auto !important;        /* don't stretch when collapsed */
 }
 
 /* Bottom-left thumbnail dock */
@@ -143,45 +166,6 @@ select, input[type="range"], input[type="checkbox"] {
   width: 140px;
 }
 
-/* Status pills row */
-.status-row {
-  position: fixed;
-  top: 12px;
-  right: 12px;
-  display: flex;
-  gap: 6px;
-  pointer-events: none;
-  z-index: 30;
-}
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  background: var(--surface-strong);
-  backdrop-filter: var(--blur);
-  -webkit-backdrop-filter: var(--blur);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 11.5px;
-  color: var(--text-dim);
-  pointer-events: auto;
-}
-.pill .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--text-faint);
-}
-.pill.ok .dot   { background: var(--ok);   box-shadow: 0 0 8px var(--ok); }
-.pill.warn .dot { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
-.pill.bad .dot  { background: var(--bad);  box-shadow: 0 0 8px var(--bad); }
-.pill.mono {
-  font-family: ui-monospace, "JetBrains Mono", "Menlo", monospace;
-  font-size: 11px;
-}
-.pill.mono b { color: var(--text); font-weight: 600; }
 
 /* Form rows */
 .row {
@@ -200,6 +184,53 @@ select, input[type="range"], input[type="checkbox"] {
   font-size: 10.5px;
   color: var(--text-faint);
   line-height: 1.35;
+}
+
+.kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 1.35;
+}
+.kv .ok  { color: var(--ok); }
+.kv .bad { color: var(--bad); }
+.dot-inline {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+  margin-right: 4px;
+  transform: translateY(-1px);
+}
+
+/* Connection indicator in card header */
+.conn-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-right: 2px;
+}
+.conn-dot::before {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.conn-dot.ok::before  { background: var(--ok);  box-shadow: 0 0 8px var(--ok); }
+.conn-dot.bad::before { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+.kv-val {
+  color: var(--text);
+  font-size: 11px;
+}
+.mono {
+  font-family: ui-monospace, "JetBrains Mono", "Menlo", monospace;
 }
 
 .select, .button {

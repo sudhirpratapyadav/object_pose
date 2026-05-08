@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { Viewer } from "./Viewer";
 import { StreamState, useStream } from "./useStream";
 import { Card } from "./ui/Card";
-import { StatusPills } from "./ui/StatusPills";
 
 export default function App() {
   const wsUrl = `ws://${window.location.hostname || "localhost"}:8765`;
@@ -77,13 +76,18 @@ export default function App() {
         />
       </div>
 
-      <StatusPills
-        connected={stream.connected}
-        modelState={stream.modelState}
-        samState={stream.samState}
-      />
-
-      <Card id="depth-controls" title="Depth & view" slot="slot-tl" hidden={hideHud}>
+      <Card
+        id="controls"
+        title="Controls"
+        slot="slot-tl"
+        hidden={hideHud}
+        headerRight={
+          <span
+            className={`conn-dot ${stream.connected ? "ok" : "bad"}`}
+            title={`${stream.connected ? "Connected" : "Disconnected"} — ${wsUrl}`}
+          />
+        }
+      >
         <div className="row">
           <div className="label">Depth model</div>
           <select
@@ -139,22 +143,52 @@ export default function App() {
             />
             Camera axes
           </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showBBox}
+              onChange={(e) => setShowBBox(e.target.checked)}
+            />
+            Show 3D bounding box
+          </label>
         </div>
 
         <div className="row">
-          <div className="label">RGB</div>
-          {imgUrl ? (
-            <div className="img-frame">
-              <img src={imgUrl} className="thumb" />
-              <span className="badge">
-                <b>{stream.stats ? stream.stats.rgb_fps.toFixed(1) : "—"}</b>
-                {" fps "}
-                <span className="dim">
-                  {stream.meta ? `· ${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
-                </span>
+          <div className="label">SAM2 model</div>
+          <select
+            className="select"
+            value={currentSamModel}
+            disabled={!samModels.length}
+            onChange={(e) => stream.setSamModel(e.target.value)}
+          >
+            {samModels.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+          <div className="kv">
+            <span>{stream.samState ? renderSamStatus(stream.samState) : "—"}</span>
+            <span className="kv-val mono">
+              {stream.stats && stream.stats.sam_ms > 0
+                ? `${stream.stats.sam_ms} ms`
+                : "—"}
+            </span>
+          </div>
+        </div>
+
+        <div className="row">
+          <div className="label">RGB · click to segment</div>
+          <div className="img-frame">
+            <MaskedRgb
+              imgUrl={imgUrl}
+              stream={stream}
+              onClick={(rect, x, y) => onSegClickFromElement(rect, x, y)}
+            />
+            <span className="badge">
+              <b>{stream.stats ? stream.stats.rgb_fps.toFixed(1) : "—"}</b>
+              {" fps "}
+              <span className="dim">
+                {stream.meta ? `· ${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
               </span>
-            </div>
-          ) : <div className="help">—</div>}
+            </span>
+          </div>
         </div>
 
         <div className="row">
@@ -173,58 +207,12 @@ export default function App() {
           ) : <div className="help">—</div>}
         </div>
 
-        <div className="help">press H to toggle HUD</div>
-      </Card>
-
-      <Card id="segmentation" title="Segmentation (SAM2)" slot="slot-tr" hidden={hideHud}>
-        <div className="row">
-          <div className="label">Model</div>
-          <select
-            className="select"
-            value={currentSamModel}
-            disabled={!samModels.length}
-            onChange={(e) => stream.setSamModel(e.target.value)}
-          >
-            {samModels.map((m) => <option key={m} value={m}>{m}</option>)}
-          </select>
-          <div className="help">
-            {stream.samState ? renderSamStatus(stream.samState) : "—"}
-          </div>
-        </div>
-
-        <div className="row">
-          <div className="label">Click image to segment</div>
-          <div className="img-frame">
-            <MaskedRgb
-              imgUrl={imgUrl}
-              stream={stream}
-              onClick={(rect, x, y) => onSegClickFromElement(rect, x, y)}
-            />
-            <span className="badge">
-              {stream.stats && stream.stats.sam_ms > 0
-                ? <><b>{stream.stats.sam_ms}</b>{" ms · "}</>
-                : null}
-              <span className="dim">
-                {stream.meta ? `${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
-              </span>
-            </span>
-          </div>
-        </div>
-
-        <label className="toggle">
-          <input
-            type="checkbox"
-            checked={showBBox}
-            onChange={(e) => setShowBBox(e.target.checked)}
-          />
-          Show 3D bounding box
-        </label>
-
         <button className="button accent" onClick={() => stream.samClear()}>
           Clear selection
         </button>
-      </Card>
 
+        <div className="help">press H to toggle HUD</div>
+      </Card>
     </div>
   );
 }

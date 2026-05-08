@@ -9,6 +9,8 @@ type Props = {
   hidden?: boolean;
   collapsible?: boolean;
   defaultCollapsed?: boolean;
+  /** Optional element rendered on the right side of the header (status, etc). */
+  headerRight?: React.ReactNode;
   children: React.ReactNode;
 };
 
@@ -18,6 +20,7 @@ const KEY = (id: string) => `obj-pose:collapsed:${id}`;
 export function Card({
   id, title, slot, zIndex = 20, hidden = false,
   collapsible = true, defaultCollapsed = false,
+  headerRight,
   children,
 }: Props) {
   const [collapsed, setCollapsed] = useState<boolean>(() => {
@@ -50,7 +53,10 @@ export function Card({
         style={{ cursor: collapsible ? "pointer" : "default" }}
       >
         <span>{title}</span>
-        {collapsible && <span className="chevron" aria-hidden>▾</span>}
+        <span className="card-header-actions">
+          {headerRight}
+          {collapsible && <span className="chevron" aria-hidden>▾</span>}
+        </span>
       </div>
       <div className="card-body">{children}</div>
     </div>
