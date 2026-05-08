@@ -38,6 +38,8 @@ def _frustum_segments(width: int, height: int,
 class Viewer:
     def __init__(self, width: int, height: int,
                  fx: float, fy: float, cx: float, cy: float,
+                 model_keys: list[str] | None = None,
+                 default_model: str | None = None,
                  label: str = "Object Pose Detector"):
         self.server = viser.ViserServer(label=label)
         blank = np.zeros((height, width, 3), dtype=np.uint8)
@@ -59,6 +61,23 @@ class Viewer:
         def _(_):
             if self._pc_handle is not None:
                 self._pc_handle.point_size = self.sl_pc_size.value
+
+        # Depth model dropdown — selection is read by main loop
+        self._on_model_change = None
+        if model_keys:
+            with self.server.gui.add_folder("Depth Model"):
+                self.dd_model = self.server.gui.add_dropdown(
+                    "Model", options=model_keys,
+                    initial_value=default_model or model_keys[0],
+                )
+                self.txt_model_status = self.server.gui.add_text(
+                    "Status", initial_value="ready",
+                )
+
+            @self.dd_model.on_update
+            def _(_):
+                if self._on_model_change is not None:
+                    self._on_model_change(self.dd_model.value)
 
         # Origin frame (world == camera frame for now)
         self.server.scene.add_frame("/origin", axes_length=0.15, axes_radius=0.005)
@@ -90,6 +109,13 @@ class Viewer:
             colors=colors_f,
             point_size=self.sl_pc_size.value,
         )
+
+    def set_model_change_callback(self, fn) -> None:
+        self._on_model_change = fn
+
+    def set_model_status(self, text: str) -> None:
+        if hasattr(self, "txt_model_status"):
+            self.txt_model_status.value = text
 
     def update_fps(self, rgb_fps: float, depth_fps: float, pc_fps: float) -> None:
         self.txt_rgb_fps.value   = f"{rgb_fps:.1f}"

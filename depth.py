@@ -22,8 +22,20 @@ from pathlib import Path
 
 import numpy as np
 
-DEPTH_REPO  = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
-WEIGHTS_DIR = Path(__file__).parent / "weights" / "v2-indoor-small"
+MODELS: dict[str, str] = {
+    "v2-indoor-small":  "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+    "v2-indoor-base":   "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    "v2-indoor-large":  "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+    "v2-outdoor-small": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
+    "v2-outdoor-base":  "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+    "v2-outdoor-large": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
+}
+DEFAULT_MODEL = "v2-indoor-small"
+WEIGHTS_BASE  = Path(__file__).parent / "weights"
+
+
+def weights_dir(model_key: str) -> Path:
+    return WEIGHTS_BASE / model_key
 
 PC_DOWNSAMPLE = 4   # 4× stride per axis  → 1/16 of pixels
 PC_MIN_M, PC_MAX_M = 0.05, 10.0
@@ -39,15 +51,17 @@ class DepthShm:
     rgb_seq:   mp.Value
     depth_seq: mp.Value
     pc_count:  mp.Value
-    width:  int
-    height: int
-    n_max:  int
+    rgb_w:    int    # capture (full) resolution
+    rgb_h:    int
+    infer_w:  int    # depth-model inference resolution
+    infer_h:  int
+    n_max:    int
 
     def rgb_arr(self) -> np.ndarray:
-        return np.ndarray((self.height, self.width, 3), dtype=np.uint8, buffer=self.rgb.buf)
+        return np.ndarray((self.rgb_h, self.rgb_w, 3), dtype=np.uint8, buffer=self.rgb.buf)
 
     def depth_arr(self) -> np.ndarray:
-        return np.ndarray((self.height, self.width), dtype=np.float32, buffer=self.depth.buf)
+        return np.ndarray((self.infer_h, self.infer_w), dtype=np.float32, buffer=self.depth.buf)
 
     def pc_xyz_arr(self) -> np.ndarray:
         return np.ndarray((self.n_max, 3), dtype=np.float32, buffer=self.pc_xyz.buf)
@@ -65,18 +79,19 @@ class DepthShm:
             except FileNotFoundError: pass
 
 
-def create_shm(width: int, height: int) -> DepthShm:
-    n_max = (width // PC_DOWNSAMPLE) * (height // PC_DOWNSAMPLE)
-    rgb    = shared_memory.SharedMemory(create=True, size=height * width * 3)
-    depth  = shared_memory.SharedMemory(create=True, size=height * width * 4)
+def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
+    n_max = (infer_w // PC_DOWNSAMPLE) * (infer_h // PC_DOWNSAMPLE)
+    rgb    = shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w * 3)
+    depth  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 4)
     pc_xyz = shared_memory.SharedMemory(create=True, size=n_max * 3 * 4)
     pc_rgb = shared_memory.SharedMemory(create=True, size=n_max * 3)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
-        rgb_seq=mp.Value("Q", 0),    # uint64
+        rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
-        pc_count=mp.Value("I", 0),   # uint32
-        width=width, height=height, n_max=n_max,
+        pc_count=mp.Value("I", 0),
+        rgb_w=rgb_w, rgb_h=rgb_h,
+        infer_w=infer_w, infer_h=infer_h, n_max=n_max,
     )
 
 
@@ -84,43 +99,77 @@ def _open_existing(name: str) -> shared_memory.SharedMemory:
     return shared_memory.SharedMemory(name=name)
 
 
+def _download_with_progress(repo: str, wdir: Path, status_fn) -> None:
+    """Download HF snapshot, streaming current-file % via status_fn."""
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm as _tqdm
+
+    last = [0.0]
+
+    class StatusTqdm(_tqdm):
+        def update(self, n=1):
+            super().update(n)
+            now = time.time()
+            if self.total and (now - last[0] > 0.3 or self.n >= self.total):
+                pct = 100.0 * self.n / self.total
+                fname = (self.desc or "").split("/")[-1] or "file"
+                status_fn("downloading", fname, pct)
+                last[0] = now
+
+    status_fn("downloading", "...", 0.0)
+    snapshot_download(repo_id=repo, local_dir=str(wdir), tqdm_class=StatusTqdm)
+
+
 def depth_worker(
     rgb_name: str, depth_name: str, pc_xyz_name: str, pc_rgb_name: str,
     rgb_seq, depth_seq, pc_count,
-    width: int, height: int, n_max: int,
+    rgb_w: int, rgb_h: int, infer_w: int, infer_h: int, n_max: int,
     fx: float, fy: float, cx: float, cy: float,
     stop_ev,
+    status_q=None,
+    model_key: str = DEFAULT_MODEL,
     device: str = "cuda",
 ):
+    def status(*msg):
+        if status_q is not None:
+            try: status_q.put_nowait(msg)
+            except Exception: pass
+    """Inference runs at (infer_w, infer_h). Intrinsics fx/fy/cx/cy must be in
+    the inference frame (already scaled by caller)."""
     rgb_shm    = _open_existing(rgb_name)
     depth_shm  = _open_existing(depth_name)
     pc_xyz_shm = _open_existing(pc_xyz_name)
     pc_rgb_shm = _open_existing(pc_rgb_name)
 
-    rgb_arr    = np.ndarray((height, width, 3), dtype=np.uint8, buffer=rgb_shm.buf)
-    depth_arr  = np.ndarray((height, width),    dtype=np.float32, buffer=depth_shm.buf)
-    pc_xyz_arr = np.ndarray((n_max, 3),         dtype=np.float32, buffer=pc_xyz_shm.buf)
-    pc_rgb_arr = np.ndarray((n_max, 3),         dtype=np.uint8,   buffer=pc_rgb_shm.buf)
+    rgb_arr    = np.ndarray((rgb_h, rgb_w, 3),       dtype=np.uint8,   buffer=rgb_shm.buf)
+    depth_arr  = np.ndarray((infer_h, infer_w),      dtype=np.float32, buffer=depth_shm.buf)
+    pc_xyz_arr = np.ndarray((n_max, 3),              dtype=np.float32, buffer=pc_xyz_shm.buf)
+    pc_rgb_arr = np.ndarray((n_max, 3),              dtype=np.uint8,   buffer=pc_rgb_shm.buf)
 
     from PIL import Image
     from transformers import pipeline as hf_pipeline
 
-    if not (WEIGHTS_DIR / "model.safetensors").exists():
-        from huggingface_hub import snapshot_download
-        print(f"[depth] downloading {DEPTH_REPO} -> {WEIGHTS_DIR}")
-        snapshot_download(repo_id=DEPTH_REPO, local_dir=str(WEIGHTS_DIR))
+    repo  = MODELS[model_key]
+    wdir  = weights_dir(model_key)
+    if not (wdir / "model.safetensors").exists():
+        print(f"[depth] downloading {repo} -> {wdir}")
+        _download_with_progress(repo, wdir, status)
 
-    print(f"[depth] loading model on {device} ...")
+    status("loading")
+    print(f"[depth] loading {model_key} on {device} (infer {infer_w}x{infer_h}) ...")
     t0 = time.time()
-    pipe = hf_pipeline("depth-estimation", model=str(WEIGHTS_DIR), device=device)
-    pipe(Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8)))  # warmup
-    print(f"[depth] ready in {time.time()-t0:.1f}s")
+    pipe = hf_pipeline("depth-estimation", model=str(wdir), device=device)
 
-    # Pre-compute pixel grid for back-projection (downsampled)
+    status("warming")
+    pipe(Image.fromarray(np.zeros((infer_h, infer_w, 3), dtype=np.uint8)))  # warmup
+    print(f"[depth] ready in {time.time()-t0:.1f}s")
+    status("ready")
+
+    # Pre-compute pixel grid for back-projection (in inference frame, downsampled)
     ds = PC_DOWNSAMPLE
-    u = np.arange(0, width,  ds, dtype=np.float32)
-    v = np.arange(0, height, ds, dtype=np.float32)
-    uu, vv = np.meshgrid(u, v)        # (h//ds, w//ds)
+    u = np.arange(0, infer_w, ds, dtype=np.float32)
+    v = np.arange(0, infer_h, ds, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
     x_norm = (uu - cx) / fx
     y_norm = (vv - cy) / fy
 
@@ -133,27 +182,31 @@ def depth_worker(
             continue
         last_seen = cur
 
-        # Snapshot the RGB buffer (cheap copy keeps inference inputs stable)
-        rgb_local = rgb_arr.copy()
+        # Snapshot full-res RGB, then downsample for inference
+        rgb_full = rgb_arr.copy()
+        rgb_pil  = Image.fromarray(rgb_full).resize((infer_w, infer_h), Image.BILINEAR)
+        rgb_inf  = np.asarray(rgb_pil)
 
-        out = pipe(Image.fromarray(rgb_local))
+        out = pipe(rgb_pil)
         d = out["predicted_depth"]
         if hasattr(d, "cpu"):
             d = d.cpu()
         d = np.clip(d.numpy().astype(np.float32), 0.0, PC_MAX_M)
+        # Some HF depth pipelines return (H_in, W_in); ensure inference shape
+        if d.shape != (infer_h, infer_w):
+            d = np.asarray(Image.fromarray(d).resize((infer_w, infer_h), Image.BILINEAR))
 
-        # Back-project (downsampled)
-        d_ds = d[::ds, ::ds]
-        rgb_ds = rgb_local[::ds, ::ds]
-        valid = (d_ds > PC_MIN_M) & (d_ds < PC_MAX_M)
+        # Back-project (in inference frame, downsampled)
+        d_ds   = d[::ds, ::ds]
+        rgb_ds = rgb_inf[::ds, ::ds]
+        valid  = (d_ds > PC_MIN_M) & (d_ds < PC_MAX_M)
         zs = d_ds[valid]
         xs = x_norm[valid] * zs
         ys = y_norm[valid] * zs
-        pts = np.stack([xs, ys, zs], axis=1).astype(np.float32)
+        pts  = np.stack([xs, ys, zs], axis=1).astype(np.float32)
         cols = rgb_ds[valid].astype(np.uint8)
         n = min(len(pts), n_max)
 
-        # Publish
         depth_arr[...] = d
         pc_xyz_arr[:n] = pts[:n]
         pc_rgb_arr[:n] = cols[:n]
