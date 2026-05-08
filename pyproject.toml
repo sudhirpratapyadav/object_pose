@@ -18,6 +18,7 @@ dependencies = [
     "transformers>=4.40",
     "huggingface-hub>=0.23",
     "tqdm>=4.65",
+    "opencv-python>=4.8",
 ]
 
 [project.optional-dependencies]
