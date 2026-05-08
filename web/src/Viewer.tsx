@@ -171,6 +171,72 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     const mesh = new THREE.Mesh(meshGeom, meshMat);
     scene.add(mesh);
 
+    // Click-feedback sphere: brief 400ms ping at the 3D hit point.
+    const pingGeom = new THREE.SphereGeometry(0.012, 12, 8);
+    const pingMat = new THREE.MeshBasicMaterial({
+      color: 0xffaa33, transparent: true, opacity: 0.0, depthTest: false,
+    });
+    const ping = new THREE.Mesh(pingGeom, pingMat);
+    ping.renderOrder = 999;
+    ping.visible = false;
+    scene.add(ping);
+    let pingT0 = 0;
+
+    // Raycaster for picking. Threshold for points hit-test scales with the
+    // current point size so it feels right.
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points = { threshold: 0.02 };
+
+    // Track mouse-down to suppress clicks that were really drags (orbit/pan).
+    let downX = 0, downY = 0;
+    const CLICK_MOVE_TOL = 4;  // px
+    const onCanvasMouseDown = (e: MouseEvent) => {
+      downX = e.clientX;
+      downY = e.clientY;
+    };
+
+    const onCanvasClick = (e: MouseEvent) => {
+      if (Math.abs(e.clientX - downX) > CLICK_MOVE_TOL ||
+          Math.abs(e.clientY - downY) > CLICK_MOVE_TOL) {
+        return;  // it was a drag, not a click
+      }
+      const meta = streamRef.current.meta;
+      if (!meta) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      raycaster.params.Points = { threshold: Math.max(0.01, propsRef.current.pointSize * 2) };
+
+      const mode = propsRef.current.display;
+      const targets: THREE.Object3D[] = [];
+      if (mode === "points" || mode === "both") targets.push(points);
+      if (mode === "mesh" || mode === "both") targets.push(mesh);
+      if (!targets.length) return;
+
+      const hits = raycaster.intersectObjects(targets, false);
+      if (!hits.length) return;
+      const hit = hits[0];
+      const p = hit.point;       // already in scene/camera-frame world coords
+
+      // Show the ping at the hit point.
+      ping.position.copy(p);
+      ping.visible = true;
+      pingT0 = performance.now();
+
+      // Project to inference-frame pixel coords.
+      const z = Math.max(p.z, 1e-3);
+      const u_inf = meta.fx_infer * (p.x / z) + meta.cx_infer;
+      const v_inf = meta.fy_infer * (p.y / z) + meta.cy_infer;
+      const x = Math.round(Math.max(0, Math.min(meta.infer_w - 1, u_inf)));
+      const y = Math.round(Math.max(0, Math.min(meta.infer_h - 1, v_inf)));
+      streamRef.current.samClick(x, y);
+    };
+    renderer.domElement.addEventListener("mousedown", onCanvasMouseDown);
+    renderer.domElement.addEventListener("click", onCanvasClick);
+
     // Resize
     const onResize = () => {
       const w = container.clientWidth, h = container.clientHeight;
@@ -257,6 +323,19 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         meshGeom.computeBoundingSphere();
       }
 
+      // Animate the click-feedback ping (grow + fade over 400ms).
+      if (ping.visible) {
+        const t = (performance.now() - pingT0) / 400;
+        if (t >= 1) {
+          ping.visible = false;
+          pingMat.opacity = 0;
+        } else {
+          const s = 0.6 + 1.4 * t;
+          ping.scale.set(s, s, s);
+          pingMat.opacity = 0.8 * (1 - t);
+        }
+      }
+
       controls.update();
       renderer.render(scene, camera);
       raf = requestAnimationFrame(animate);
@@ -266,6 +345,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
+      renderer.domElement.removeEventListener("mousedown", onCanvasMouseDown);
+      renderer.domElement.removeEventListener("click", onCanvasClick);
       controls.dispose();
       renderer.dispose();
       pointsMat.dispose();
@@ -276,6 +357,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       frustumMat.dispose();
       bboxGeom.dispose();
       bboxMat.dispose();
+      pingGeom.dispose();
+      pingMat.dispose();
       container.removeChild(renderer.domElement);
     };
     // We intentionally only run this effect once; values are read via refs/closure
