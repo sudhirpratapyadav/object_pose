@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Viewer } from "./Viewer";
 import { StreamState, useStream } from "./useStream";
+import { Card } from "./ui/Card";
+import { StatusPills } from "./ui/StatusPills";
 
 export default function App() {
   const wsUrl = `ws://${window.location.hostname || "localhost"}:8765`;
@@ -9,10 +11,24 @@ export default function App() {
   const [pointSize, setPointSize] = useState(0.01);
   const [inversePerspective, setInversePerspective] = useState(true);
   const [display, setDisplay] = useState<"points" | "mesh" | "both">("points");
-  const [showCamera, setShowCamera] = useState(true);
+  const [showCamera, setShowCamera] = useState(false);
+  const [showBBox, setShowBBox] = useState(false);
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [depthUrl, setDepthUrl] = useState<string | null>(null);
+  const [hideHud, setHideHud] = useState(false);
 
+  // Press H to toggle HUD panels (status pills stay).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
+      if (e.key === "h" || e.key === "H") setHideHud((v) => !v);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Pull blob-url state from refs at ~30fps without re-rendering everything.
   useEffect(() => {
     let alive = true;
     let lastRgb = -1, lastDepth = -1;
@@ -42,51 +58,69 @@ export default function App() {
     if (!stream.meta) return;
     const px = (clientX - rect.left) / rect.width;
     const py = (clientY - rect.top) / rect.height;
-    // Click is sent in INFERENCE-frame pixels (matches backend convention).
     const x = Math.round(px * stream.meta.infer_w);
     const y = Math.round(py * stream.meta.infer_h);
     stream.samClick(x, y);
   };
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", height: "100%" }}>
-      <div style={{ padding: 12, borderRight: "1px solid #1f242b", overflow: "auto" }}>
-        <h2 style={{ margin: "4px 0 12px" }}>Object Pose</h2>
-        <div style={{ marginBottom: 8, fontSize: 12, color: stream.connected ? "#7ee787" : "#ff7b72" }}>
-          {stream.connected ? "● connected" : "● disconnected"} ({wsUrl})
-        </div>
+    <div style={{ position: "fixed", inset: 0 }}>
+      {/* 3D viewer fills the whole window as the background. */}
+      <div style={{ position: "fixed", inset: 0, zIndex: 0 }}>
+        <Viewer
+          stream={stream}
+          pointSize={pointSize}
+          inversePerspective={inversePerspective}
+          display={display}
+          showCamera={showCamera}
+          showBBox={showBBox}
+        />
+      </div>
 
-        <Section title="Depth model">
+      <StatusPills
+        connected={stream.connected}
+        modelState={stream.modelState}
+        samState={stream.samState}
+      />
+
+      <Card id="depth-controls" title="Depth & view" slot="slot-tl" hidden={hideHud}>
+        <div className="row">
+          <div className="label">Depth model</div>
           <select
+            className="select"
             value={currentModel}
             disabled={!models.length}
             onChange={(e) => stream.setModel(e.target.value)}
-            style={{ width: "100%", padding: 4, background: "#11151a", color: "#e5e7eb", border: "1px solid #1f242b" }}
           >
             {models.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
-          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
-            {stream.modelState ? renderStatus(stream.modelState) : "—"}
+          <div className="help">{stream.modelState ? renderStatus(stream.modelState) : "—"}</div>
+        </div>
+
+        <div className="row">
+          <div className="label">Display</div>
+          <div className="segmented">
+            {(["points", "mesh", "both"] as const).map((m) => (
+              <button
+                key={m}
+                className={display === m ? "active" : ""}
+                onClick={() => setDisplay(m)}
+              >
+                {m}
+              </button>
+            ))}
           </div>
-        </Section>
+        </div>
 
-        <Section title="Display">
-          {(["points", "mesh", "both"] as const).map((m) => (
-            <label key={m} style={{ marginRight: 8 }}>
-              <input
-                type="radio"
-                name="display"
-                checked={display === m}
-                onChange={() => setDisplay(m)}
-              />
-              {m}
-            </label>
-          ))}
-        </Section>
-
-        <Section title="Point size">
-          <Slider min={0.001} max={0.1} step={0.001} value={pointSize} onChange={setPointSize} />
-          <label style={{ display: "block", marginTop: 4 }}>
+        <div className="row">
+          <div className="label">Point size · {pointSize.toFixed(3)}</div>
+          <input
+            className="range"
+            type="range" min={0.001} max={0.1} step={0.001}
+            value={pointSize}
+            onChange={(e) => setPointSize(parseFloat(e.target.value))}
+          />
+          <label className="toggle">
             <input
               type="checkbox"
               checked={inversePerspective}
@@ -94,14 +128,10 @@ export default function App() {
             />
             Inverse-perspective
           </label>
-          <div style={{ fontSize: 11, opacity: 0.6 }}>
-            On: every point renders at the same screen size regardless of depth.
-            Off: world-space size, far points shrink with perspective.
-          </div>
-        </Section>
+        </div>
 
-        <Section title="Scene">
-          <label>
+        <div className="row">
+          <label className="toggle">
             <input
               type="checkbox"
               checked={showCamera}
@@ -109,72 +139,92 @@ export default function App() {
             />
             Camera axes
           </label>
-        </Section>
+        </div>
 
-        <Section title="Segmentation (SAM2)">
+        <div className="row">
+          <div className="label">RGB</div>
+          {imgUrl ? (
+            <div className="img-frame">
+              <img src={imgUrl} className="thumb" />
+              <span className="badge">
+                <b>{stream.stats ? stream.stats.rgb_fps.toFixed(1) : "—"}</b>
+                {" fps "}
+                <span className="dim">
+                  {stream.meta ? `· ${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
+                </span>
+              </span>
+            </div>
+          ) : <div className="help">—</div>}
+        </div>
+
+        <div className="row">
+          <div className="label">Depth</div>
+          {depthUrl ? (
+            <div className="img-frame">
+              <img src={depthUrl} className="thumb" />
+              <span className="badge">
+                <b>{stream.stats ? stream.stats.depth_fps.toFixed(1) : "—"}</b>
+                {" fps "}
+                <span className="dim">
+                  {stream.meta ? `· ${stream.meta.infer_w}×${stream.meta.infer_h}` : ""}
+                </span>
+              </span>
+            </div>
+          ) : <div className="help">—</div>}
+        </div>
+
+        <div className="help">press H to toggle HUD</div>
+      </Card>
+
+      <Card id="segmentation" title="Segmentation (SAM2)" slot="slot-tr" hidden={hideHud}>
+        <div className="row">
+          <div className="label">Model</div>
           <select
+            className="select"
             value={currentSamModel}
             disabled={!samModels.length}
             onChange={(e) => stream.setSamModel(e.target.value)}
-            style={{ width: "100%", padding: 4, background: "#11151a",
-                     color: "#e5e7eb", border: "1px solid #1f242b" }}
           >
             {samModels.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
-          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
+          <div className="help">
             {stream.samState ? renderSamStatus(stream.samState) : "—"}
           </div>
-          <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>
-            Click anywhere on the RGB image to segment.
+        </div>
+
+        <div className="row">
+          <div className="label">Click image to segment</div>
+          <div className="img-frame">
+            <MaskedRgb
+              imgUrl={imgUrl}
+              stream={stream}
+              onClick={(rect, x, y) => onSegClickFromElement(rect, x, y)}
+            />
+            <span className="badge">
+              {stream.stats && stream.stats.sam_ms > 0
+                ? <><b>{stream.stats.sam_ms}</b>{" ms · "}</>
+                : null}
+              <span className="dim">
+                {stream.meta ? `${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
+              </span>
+            </span>
           </div>
-          <button
-            onClick={() => stream.samClear()}
-            style={{ marginTop: 6, width: "100%", padding: 4,
-                     background: "#11151a", color: "#e5e7eb",
-                     border: "1px solid #1f242b", cursor: "pointer" }}
-          >
-            Clear selection
-          </button>
-        </Section>
+        </div>
 
-        <Section title="RGB">
-          {imgUrl
-            ? <img src={imgUrl}
-                   style={{ width: "100%", display: "block" }} />
-            : <div style={{ color: "#666" }}>—</div>}
-        </Section>
-
-        <Section title="Segmentation (mask overlay)">
-          <MaskedRgb
-            imgUrl={imgUrl}
-            stream={stream}
-            onClick={(rect, x, y) => onSegClickFromElement(rect, x, y)}
+        <label className="toggle">
+          <input
+            type="checkbox"
+            checked={showBBox}
+            onChange={(e) => setShowBBox(e.target.checked)}
           />
-        </Section>
+          Show 3D bounding box
+        </label>
 
-        <Section title="Depth">
-          {depthUrl
-            ? <img src={depthUrl} style={{ width: "100%", display: "block" }} />
-            : <div style={{ color: "#666" }}>—</div>}
-        </Section>
+        <button className="button accent" onClick={() => stream.samClear()}>
+          Clear selection
+        </button>
+      </Card>
 
-        <Section title="Stream">
-          <div style={{ fontSize: 11, opacity: 0.7 }}>
-            {stream.meta
-              ? `${stream.meta.rgb_w}x${stream.meta.rgb_h} @ ${stream.meta.viz_hz} Hz`
-              : "waiting for meta..."}
-          </div>
-        </Section>
-      </div>
-      <div style={{ position: "relative" }}>
-        <Viewer
-          stream={stream}
-          pointSize={pointSize}
-          inversePerspective={inversePerspective}
-          display={display}
-          showCamera={showCamera}
-        />
-      </div>
     </div>
   );
 }
@@ -194,17 +244,6 @@ function renderSamStatus(s: { status: string; file: string }): string {
   return s.status;
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 }}>
-        {title}
-      </div>
-      {children}
-    </div>
-  );
-}
-
 function MaskedRgb({ imgUrl, stream, onClick }: {
   imgUrl: string | null;
   stream: StreamState;
@@ -213,6 +252,24 @@ function MaskedRgb({ imgUrl, stream, onClick }: {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const lastBlobRef = useRef<string | null>(null);
+  const [pulse, setPulse] = useState<{ x: number; y: number; key: number } | null>(null);
+  const [pending, setPending] = useState(false);
+  const pendingMaskSeqRef = useRef<number>(-1);
+
+  // Drop "pending" once the mask seq advances after our click.
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      const m = stream.maskRef.current;
+      if (m && m.seq !== pendingMaskSeqRef.current) {
+        pendingMaskSeqRef.current = m.seq;
+        setPending(false);
+      }
+      if (alive) raf = requestAnimationFrame(tick);
+    };
+    let raf = requestAnimationFrame(tick);
+    return () => { alive = false; cancelAnimationFrame(raf); };
+  }, [stream]);
 
   useEffect(() => {
     let alive = true;
@@ -224,11 +281,13 @@ function MaskedRgb({ imgUrl, stream, onClick }: {
         return;
       }
 
-      // Lazy-create the <img>; reuse the same element when blob URL changes.
+      // Preload the next image off-screen and only swap in once it's decoded.
+      // This avoids a flash to "no image yet" when blob URLs change while the
+      // depth pipeline is slow and the canvas redraws between url updates.
       if (imgUrl && lastBlobRef.current !== imgUrl) {
-        const img = new Image();
-        img.src = imgUrl;
-        imgRef.current = img;
+        const next = new Image();
+        next.onload = () => { imgRef.current = next; };
+        next.src = imgUrl;
         lastBlobRef.current = imgUrl;
       }
       const img = imgRef.current;
@@ -250,14 +309,11 @@ function MaskedRgb({ imgUrl, stream, onClick }: {
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       }
 
-      // Overlay the mask. Mask is at mesh_grid_w x mesh_grid_h; build a small
-      // ImageData and stretch-blit it on top with multiply/source-over alpha.
       const m = stream.maskRef.current;
       if (m && m.mask.length === meta.mesh_grid_w * meta.mesh_grid_h) {
         const gw = meta.mesh_grid_w, gh = meta.mesh_grid_h;
         const overlay = ctx.createImageData(gw, gh);
         const buf = overlay.data;
-        // Highlight = orange (255, 170, 51), alpha ~140.
         for (let i = 0; i < gw * gh; i++) {
           const on = m.mask[i] !== 0;
           buf[i * 4 + 0] = 255;
@@ -265,8 +321,6 @@ function MaskedRgb({ imgUrl, stream, onClick }: {
           buf[i * 4 + 2] = 51;
           buf[i * 4 + 3] = on ? 140 : 0;
         }
-        // Use an offscreen canvas to upscale with smoothing off (so mask edges
-        // align to grid cells, no halos).
         const off = document.createElement("canvas");
         off.width = gw; off.height = gh;
         const offCtx = off.getContext("2d");
@@ -283,29 +337,26 @@ function MaskedRgb({ imgUrl, stream, onClick }: {
     return () => { alive = false; cancelAnimationFrame(raf); };
   }, [stream, imgUrl]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      onClick={(e) =>
-        onClick(e.currentTarget.getBoundingClientRect(), e.clientX, e.clientY)
-      }
-      style={{ width: "100%", display: "block", cursor: "crosshair",
-               background: "#11151a" }}
-    />
-  );
-}
+  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    setPulse({ x: e.clientX - rect.left, y: e.clientY - rect.top, key: Date.now() });
+    setPending(true);
+    pendingMaskSeqRef.current = stream.maskRef.current?.seq ?? -1;
+    onClick(rect, e.clientX, e.clientY);
+  };
 
-function Slider({ min, max, step, value, onChange }: {
-  min: number; max: number; step: number; value: number; onChange: (v: number) => void;
-}) {
   return (
-    <div>
-      <input
-        type="range" min={min} max={max} step={step} value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        style={{ width: "100%" }}
-      />
-      <div style={{ fontSize: 11, opacity: 0.7 }}>{value.toFixed(3)}</div>
+    <div className="mask-wrap">
+      <canvas ref={canvasRef} className="canvas-mask" onClick={handleClick} />
+      {pulse && (
+        <span
+          key={pulse.key}
+          className="pulse"
+          style={{ left: pulse.x, top: pulse.y }}
+          onAnimationEnd={() => setPulse(null)}
+        />
+      )}
+      {pending && <div className="spinner" />}
     </div>
   );
 }

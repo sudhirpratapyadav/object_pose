@@ -15,6 +15,7 @@ export const KIND_DEPTH_JPEG = 4;
 export const KIND_MODEL_STATE = 5;
 export const KIND_MASK = 6;
 export const KIND_SAM_STATE = 7;
+export const KIND_STATS = 8;
 
 export type ModelState = {
   model: string;
@@ -27,6 +28,12 @@ export type SamState = {
   model: string;
   status: string;
   file: string;
+};
+
+export type Stats = {
+  rgb_fps: number;
+  depth_fps: number;
+  sam_ms: number;
 };
 
 export type Meta = {
@@ -85,9 +92,13 @@ export type MaskFrame = {
   boxMax: Float32Array;
 };
 
+export type StatsFrame = {
+  kind: typeof KIND_STATS; seq: number; stats: Stats;
+};
+
 export type Frame =
   | PointsFrame | MeshFrame | JpegFrame | MetaFrame
-  | ModelStateFrame | SamStateFrame | MaskFrame;
+  | ModelStateFrame | SamStateFrame | MaskFrame | StatsFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -173,6 +184,11 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const boxMin = new Float32Array(buf.slice(off, off + 12)); off += 12;
       const boxMax = new Float32Array(buf.slice(off, off + 12)); off += 12;
       return { kind: KIND_MASK, seq, maskSeq, mask, hasBox, boxMin, boxMax };
+    }
+    case KIND_STATS: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const stats = JSON.parse(text) as Stats;
+      return { kind: KIND_STATS, seq, stats };
     }
   }
   return null;

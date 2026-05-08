@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Frame, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH, KIND_META,
-  KIND_MODEL_STATE, KIND_POINTS, KIND_SAM_STATE, Meta, ModelState, SamState,
-  parseFrame,
+  KIND_MODEL_STATE, KIND_POINTS, KIND_SAM_STATE, KIND_STATS, Meta, ModelState,
+  SamState, Stats, parseFrame,
 } from "./protocol";
 
 type JpegRef = React.MutableRefObject<{ blobUrl: string | null; seq: number }>;
@@ -19,6 +19,7 @@ export type StreamState = {
   meta: Meta | null;
   modelState: ModelState | null;
   samState: SamState | null;
+  stats: Stats | null;
   pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
   meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
@@ -35,6 +36,7 @@ export function useStream(url: string): StreamState {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [modelState, setModelState] = useState<ModelState | null>(null);
   const [samState, setSamState] = useState<SamState | null>(null);
+  const [stats, setStats] = useState<Stats | null>(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -47,12 +49,16 @@ export function useStream(url: string): StreamState {
   useEffect(() => {
     let cancelled = false;
 
+    // Defer URL.revokeObjectURL so any <img> still pointing at the previous
+    // blob has time to swap in the new one before the old URL is invalidated.
+    // Without this, slow producers cause a flash to "broken image" between
+    // the new URL being chosen and the new bytes being decoded.
     const setBlob = (ref: JpegRef, bytes: Uint8Array, seq: number) => {
       const blob = new Blob([bytes], { type: "image/jpeg" });
       const u = URL.createObjectURL(blob);
       const old = ref.current.blobUrl;
       ref.current = { blobUrl: u, seq };
-      if (old) URL.revokeObjectURL(old);
+      if (old) setTimeout(() => URL.revokeObjectURL(old), 500);
     };
 
     const connect = () => {
@@ -80,6 +86,9 @@ export function useStream(url: string): StreamState {
             break;
           case KIND_SAM_STATE:
             setSamState(frame.state);
+            break;
+          case KIND_STATS:
+            setStats(frame.stats);
             break;
           case KIND_MASK:
             maskRef.current = {
@@ -135,7 +144,7 @@ export function useStream(url: string): StreamState {
   const samClear = useCallback(() => send({ sam_clear: true }), []);
 
   return {
-    meta, modelState, samState,
+    meta, modelState, samState, stats,
     pointsRef, meshRef, jpegRef, depthJpegRef, maskRef,
     connected, setModel, setSamModel, samClick, samClear,
   };

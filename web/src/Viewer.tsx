@@ -9,6 +9,7 @@ type Props = {
   inversePerspective: boolean;
   display: "points" | "mesh" | "both";
   showCamera: boolean;
+  showBBox: boolean;
 };
 
 const POINT_VS = /* glsl */ `
@@ -41,10 +42,14 @@ void main() {
   gl_FragColor = vec4(c, 1.0);
 }`;
 
-export function Viewer({ stream, pointSize, inversePerspective, display, showCamera }: Props) {
+export function Viewer({ stream, pointSize, inversePerspective, display, showCamera, showBBox }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera });
-  propsRef.current = { pointSize, inversePerspective, display, showCamera };
+  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera, showBBox });
+  propsRef.current = { pointSize, inversePerspective, display, showCamera, showBBox };
+  // Mirror `stream` into a ref so the (mount-only) effect always sees the
+  // latest meta + state objects, not the ones captured at mount.
+  const streamRef = useRef(stream);
+  streamRef.current = stream;
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -71,10 +76,38 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     scene.add(axes);
 
     // Bounding box for the segmented region.
-    const bbox = new THREE.Box3();
-    const bboxHelper = new THREE.Box3Helper(bbox, new THREE.Color(0xffaa33));
-    bboxHelper.visible = false;
-    scene.add(bboxHelper);
+    // Bbox lines: build from raw vertices each time mask updates. Box3Helper's
+    // geometry doesn't refresh when the underlying Box3 mutates, so we own the
+    // geometry directly.
+    const bboxGeom = new THREE.BufferGeometry();
+    bboxGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(24 * 3), 3));
+    const bboxMat = new THREE.LineBasicMaterial({ color: 0xff8833 });
+    const bboxLines = new THREE.LineSegments(bboxGeom, bboxMat);
+    bboxLines.visible = false;
+    scene.add(bboxLines);
+
+    const setBBox = (mn: ArrayLike<number>, mx: ArrayLike<number>) => {
+      const [x0, y0, z0] = [mn[0], mn[1], mn[2]];
+      const [x1, y1, z1] = [mx[0], mx[1], mx[2]];
+      const c = [
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+      ];
+      const edges = [
+        0, 1, 1, 2, 2, 3, 3, 0,   // bottom
+        4, 5, 5, 6, 6, 7, 7, 4,   // top
+        0, 4, 1, 5, 2, 6, 3, 7,   // verticals
+      ];
+      const arr = (bboxGeom.getAttribute("position") as THREE.BufferAttribute).array as Float32Array;
+      for (let i = 0; i < edges.length; i++) {
+        const v = c[edges[i]];
+        arr[i * 3 + 0] = v[0];
+        arr[i * 3 + 1] = v[1];
+        arr[i * 3 + 2] = v[2];
+      }
+      (bboxGeom.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+      bboxGeom.computeBoundingSphere();
+    };
     // Camera frustum (placeholder; sized later when meta arrives)
     const frustumGeom = new THREE.BufferGeometry();
     const frustumMat = new THREE.LineBasicMaterial({ color: 0x33cc55 });
@@ -126,9 +159,9 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
 
     const animate = () => {
       // Apply meta -> frustum once
-      if (!metaApplied && stream.meta) {
+      if (!metaApplied && streamRef.current.meta) {
         metaApplied = true;
-        const m = stream.meta;
+        const m = streamRef.current.meta;
         const scale = 0.3;
         const corners: [number, number, number][] = [
           [(0       - m.cx) / m.fx * scale, (0       - m.cy) / m.fy * scale, scale],
@@ -168,19 +201,15 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         pointsGeom.computeBoundingSphere();
       }
 
-      // Update bbox from mask frames
-      const mr = stream.maskRef.current;
+      // Update bbox from mask frames (latest meta lives behind streamRef)
+      const mr = streamRef.current.maskRef.current;
       if (mr && mr.seq !== lastMaskSeq) {
         lastMaskSeq = mr.seq;
-        if (mr.hasBox) {
-          bbox.min.set(mr.boxMin[0], mr.boxMin[1], mr.boxMin[2]);
-          bbox.max.set(mr.boxMax[0], mr.boxMax[1], mr.boxMax[2]);
-          bboxHelper.box = bbox;
-          bboxHelper.visible = true;
-        } else {
-          bboxHelper.visible = false;
-        }
+        if (mr.hasBox) setBBox(mr.boxMin, mr.boxMax);
       }
+      bboxLines.visible =
+        propsRef.current.showBBox &&
+        !!streamRef.current.maskRef.current?.hasBox;
 
       // Update mesh
       const mf = stream.meshRef.current;
@@ -211,8 +240,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       meshGeom.dispose();
       frustumGeom.dispose();
       frustumMat.dispose();
-      bboxHelper.geometry.dispose();
-      (bboxHelper.material as THREE.LineBasicMaterial).dispose();
+      bboxGeom.dispose();
+      bboxMat.dispose();
       container.removeChild(renderer.domElement);
     };
     // We intentionally only run this effect once; values are read via refs/closure

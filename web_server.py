@@ -48,6 +48,7 @@ KIND_DEPTH_JPEG  = 4  # turbo-colormapped depth image
 KIND_MODEL_STATE = 5  # current depth model + status text + progress
 KIND_MASK        = 6  # SAM2 mask (per-point) + AABB
 KIND_SAM_STATE   = 7  # current SAM2 model + status
+KIND_STATS       = 8  # 1 Hz live stats: rgb fps, depth fps, sam_ms
 
 
 def _pack_header(seq: int, kind: int) -> bytes:
@@ -106,6 +107,10 @@ def _frame_model_state(seq: int, payload: dict) -> bytes:
 
 def _frame_sam_state(seq: int, payload: dict) -> bytes:
     return _pack_header(seq, KIND_SAM_STATE) + json.dumps(payload).encode("utf-8")
+
+
+def _frame_stats(seq: int, payload: dict) -> bytes:
+    return _pack_header(seq, KIND_STATS) + json.dumps(payload).encode("utf-8")
 
 
 def _frame_mask(seq: int, mask_seq: int, mask: np.ndarray,
@@ -356,17 +361,22 @@ async def main_async(args) -> None:
         await asyncio.to_thread(spawn_seg, key)
         await hub.broadcast(_frame_sam_state(0, make_sam_state_payload()))
 
+    sam_pending_t = {"t": 0.0}    # mutable closure cell for click-time
+    sam_last_ms = {"v": 0}        # most recent click->mask latency (ms)
+
     async def on_sam_click(x: int, y: int) -> None:
         # Coordinates arrive in INFERENCE-frame pixels.
         with seg.click_x.get_lock(): seg.click_x.value = int(x)
         with seg.click_y.get_lock(): seg.click_y.value = int(y)
         with seg.click_seq.get_lock(): seg.click_seq.value = seg.click_seq.value + 1
+        sam_pending_t["t"] = time.monotonic()
 
     async def on_sam_clear() -> None:
         # Sentinel: negative coords -> worker clears mask.
         with seg.click_x.get_lock(): seg.click_x.value = -1
         with seg.click_y.get_lock(): seg.click_y.value = -1
         with seg.click_seq.get_lock(): seg.click_seq.value = seg.click_seq.value + 1
+        sam_pending_t["t"] = 0.0
 
     spawn_depth(args.model)
     spawn_seg(args.sam_model)
@@ -495,6 +505,10 @@ async def main_async(args) -> None:
                 cur_m = seg.mask_seq.value
             if cur_m != last_mask_seq:
                 last_mask_seq = cur_m
+                # Click->mask latency
+                if sam_pending_t["t"] > 0.0:
+                    sam_last_ms["v"] = int((time.monotonic() - sam_pending_t["t"]) * 1000)
+                    sam_pending_t["t"] = 0.0
                 with seg.has_mask.get_lock():
                     has_box = bool(seg.has_mask.value)
                 box_min = seg_bbox[0:3].copy()
@@ -506,8 +520,16 @@ async def main_async(args) -> None:
 
             if time.time() - t_log >= 1.0:
                 dt = time.time() - t_log
-                print(f"[ws] rgb {n_rgb/dt:.1f}  depth {n_depth/dt:.1f}  "
+                rgb_fps = n_rgb / dt
+                depth_fps = n_depth / dt
+                print(f"[ws] rgb {rgb_fps:.1f}  depth {depth_fps:.1f}  "
                       f"clients={len(hub.clients)}", flush=True)
+                await hub.broadcast(_frame_stats(seq, {
+                    "rgb_fps":   round(rgb_fps, 1),
+                    "depth_fps": round(depth_fps, 1),
+                    "sam_ms":    sam_last_ms["v"],
+                }))
+                seq += 1
                 n_rgb = n_depth = 0
                 t_log = time.time()
 
