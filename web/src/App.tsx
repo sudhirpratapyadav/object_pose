@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Viewer } from "./Viewer";
-import { useStream } from "./useStream";
+import { StreamState, useStream } from "./useStream";
 
 export default function App() {
   const wsUrl = `ws://${window.location.hostname || "localhost"}:8765`;
@@ -38,12 +38,10 @@ export default function App() {
   const samModels = stream.meta?.sam_models ?? [];
   const currentSamModel = stream.samState?.model ?? stream.meta?.sam_default_model ?? "";
 
-  const onRgbClick = (e: React.MouseEvent<HTMLImageElement>) => {
+  const onSegClickFromElement = (rect: DOMRect, clientX: number, clientY: number) => {
     if (!stream.meta) return;
-    const img = e.currentTarget;
-    const rect = img.getBoundingClientRect();
-    const px = (e.clientX - rect.left) / rect.width;
-    const py = (e.clientY - rect.top) / rect.height;
+    const px = (clientX - rect.left) / rect.width;
+    const py = (clientY - rect.top) / rect.height;
     // Click is sent in INFERENCE-frame pixels (matches backend convention).
     const x = Math.round(px * stream.meta.infer_w);
     const y = Math.round(py * stream.meta.infer_h);
@@ -139,12 +137,19 @@ export default function App() {
           </button>
         </Section>
 
-        <Section title="RGB (click to segment)">
+        <Section title="RGB">
           {imgUrl
-            ? <img src={imgUrl} onClick={onRgbClick}
-                   style={{ width: "100%", display: "block",
-                            cursor: "crosshair" }} />
+            ? <img src={imgUrl}
+                   style={{ width: "100%", display: "block" }} />
             : <div style={{ color: "#666" }}>—</div>}
+        </Section>
+
+        <Section title="Segmentation (mask overlay)">
+          <MaskedRgb
+            imgUrl={imgUrl}
+            stream={stream}
+            onClick={(rect, x, y) => onSegClickFromElement(rect, x, y)}
+          />
         </Section>
 
         <Section title="Depth">
@@ -197,6 +202,96 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       </div>
       {children}
     </div>
+  );
+}
+
+function MaskedRgb({ imgUrl, stream, onClick }: {
+  imgUrl: string | null;
+  stream: StreamState;
+  onClick: (rect: DOMRect, clientX: number, clientY: number) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const lastBlobRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const draw = () => {
+      const canvas = canvasRef.current;
+      const meta = stream.meta;
+      if (!canvas || !meta) {
+        if (alive) raf = requestAnimationFrame(draw);
+        return;
+      }
+
+      // Lazy-create the <img>; reuse the same element when blob URL changes.
+      if (imgUrl && lastBlobRef.current !== imgUrl) {
+        const img = new Image();
+        img.src = imgUrl;
+        imgRef.current = img;
+        lastBlobRef.current = imgUrl;
+      }
+      const img = imgRef.current;
+
+      const W = canvas.clientWidth || meta.rgb_w;
+      const targetH = Math.round(W * meta.rgb_h / meta.rgb_w);
+      if (canvas.width !== W || canvas.height !== targetH) {
+        canvas.width = W;
+        canvas.height = targetH;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        if (alive) raf = requestAnimationFrame(draw);
+        return;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (img && img.complete && img.naturalWidth > 0) {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
+
+      // Overlay the mask. Mask is at mesh_grid_w x mesh_grid_h; build a small
+      // ImageData and stretch-blit it on top with multiply/source-over alpha.
+      const m = stream.maskRef.current;
+      if (m && m.mask.length === meta.mesh_grid_w * meta.mesh_grid_h) {
+        const gw = meta.mesh_grid_w, gh = meta.mesh_grid_h;
+        const overlay = ctx.createImageData(gw, gh);
+        const buf = overlay.data;
+        // Highlight = orange (255, 170, 51), alpha ~140.
+        for (let i = 0; i < gw * gh; i++) {
+          const on = m.mask[i] !== 0;
+          buf[i * 4 + 0] = 255;
+          buf[i * 4 + 1] = 170;
+          buf[i * 4 + 2] = 51;
+          buf[i * 4 + 3] = on ? 140 : 0;
+        }
+        // Use an offscreen canvas to upscale with smoothing off (so mask edges
+        // align to grid cells, no halos).
+        const off = document.createElement("canvas");
+        off.width = gw; off.height = gh;
+        const offCtx = off.getContext("2d");
+        if (offCtx) {
+          offCtx.putImageData(overlay, 0, 0);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+        }
+      }
+
+      if (alive) raf = requestAnimationFrame(draw);
+    };
+    let raf = requestAnimationFrame(draw);
+    return () => { alive = false; cancelAnimationFrame(raf); };
+  }, [stream, imgUrl]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      onClick={(e) =>
+        onClick(e.currentTarget.getBoundingClientRect(), e.clientX, e.clientY)
+      }
+      style={{ width: "100%", display: "block", cursor: "crosshair",
+               background: "#11151a" }}
+    />
   );
 }
 
