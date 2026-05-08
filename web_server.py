@@ -26,7 +26,9 @@ import cv2
 import numpy as np
 import websockets
 
-from camera import NetworkRGB, RealSenseRGB
+from pathlib import Path
+
+from camera import NetworkRGB, RealSenseRGB, VideoFile
 from depth import BACKENDS, create_shm, depth_worker, DEFAULT_MODEL
 from segment import (
     BACKENDS as SAM_BACKENDS,
@@ -38,6 +40,27 @@ from segment import (
 VIZ_HZ = 30
 CAM_W, CAM_H, CAM_FPS = 1280, 720, 30
 INFER_W, INFER_H = 640, 480
+
+VIDEO_DIR = Path(__file__).parent / "datasets"
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+
+
+def list_videos() -> list[str]:
+    """Recursively list video files under datasets/, returning paths relative
+    to VIDEO_DIR so the dropdown shows '<dataset>/<camera>/<episode>.mp4'."""
+    if not VIDEO_DIR.exists():
+        return []
+    out = []
+    for p in VIDEO_DIR.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in VIDEO_EXTS:
+            continue
+        # Skip in-flight download stubs (e.g. ".file-000.mp4.w1kE89")
+        if p.name.startswith("."):
+            continue
+        out.append(str(p.relative_to(VIDEO_DIR)))
+    return sorted(out)
 
 MAGIC = b"P3DF"
 KIND_POINTS      = 0
@@ -179,12 +202,13 @@ class Hub:
             await self.remove(ws)
 
 
-async def handler(ws, hub: Hub, meta_payload: dict,
+async def handler(ws, hub: Hub, get_meta_payload,
                   on_set_model, on_set_sam_model,
-                  on_sam_click, on_sam_clear) -> None:
+                  on_sam_click, on_sam_clear,
+                  on_set_source) -> None:
     await hub.add(ws)
     try:
-        await ws.send(_frame_meta(0, meta_payload))
+        await ws.send(_frame_meta(0, get_meta_payload()))
         async for msg in ws:
             if isinstance(msg, str):
                 try:
@@ -202,50 +226,83 @@ async def handler(ws, hub: Hub, meta_payload: dict,
                     await on_sam_click(int(c.get("x", 0)), int(c.get("y", 0)))
                 elif "sam_clear" in cmd:
                     await on_sam_clear()
+                elif "set_source" in cmd and isinstance(cmd["set_source"], dict):
+                    s = cmd["set_source"]
+                    kind = str(s.get("kind", "live"))
+                    video = s.get("video")
+                    await on_set_source(kind, str(video) if video else None)
     finally:
         await hub.remove(ws)
 
 
-async def main_async(args) -> None:
+def _make_camera(kind: str, video_name: str | None, args):
+    """Build a camera-like object for the requested source. Caller calls .start()."""
+    if kind == "video" and video_name:
+        path = VIDEO_DIR / video_name
+        if not path.exists():
+            raise FileNotFoundError(f"video not found: {path}")
+        return VideoFile(str(path))
     if args.camera == "realsense":
-        cam = RealSenseRGB(width=CAM_W, height=CAM_H, fps=CAM_FPS)
-    else:
-        cam = NetworkRGB(args.camera)
-    intr = cam.start()
+        return RealSenseRGB(width=CAM_W, height=CAM_H, fps=CAM_FPS)
+    return NetworkRGB(args.camera)
 
-    sx = INFER_W / intr.width
-    sy = INFER_H / intr.height
-    fx_i, fy_i = intr.fx * sx, intr.fy * sy
-    cx_i, cy_i = intr.cx * sx, intr.cy * sy
 
-    shm = create_shm(intr.width, intr.height, INFER_W, INFER_H)
-    seg = create_seg_shm(shm.mesh_grid_w, shm.mesh_grid_h)
-
-    rgb_buf    = shm.rgb_arr()
-    depth_buf  = shm.depth_arr()
-    pc_xyz     = shm.pc_xyz_arr()
-    pc_rgb     = shm.pc_rgb_arr()
-    pc_grid_idx = shm.pc_grid_idx_arr()
-    mesh_xyz   = shm.mesh_xyz_arr()
-    mesh_rgb   = shm.mesh_rgb_arr()
-    mesh_faces = shm.mesh_faces_arr()
-    mesh_normal = shm.mesh_normal_arr()
-    normal_img  = shm.normal_img_arr()
-    seg_mask   = seg.mask_arr()
-    seg_bbox   = seg.bbox_arr()
-
-    meta_payload = {
-        "rgb_w": intr.width, "rgb_h": intr.height,
-        "infer_w": INFER_W, "infer_h": INFER_H,
-        "fx": intr.fx, "fy": intr.fy, "cx": intr.cx, "cy": intr.cy,
-        "fx_infer": fx_i, "fy_infer": fy_i, "cx_infer": cx_i, "cy_infer": cy_i,
-        "mesh_grid_w": shm.mesh_grid_w, "mesh_grid_h": shm.mesh_grid_h,
-        "viz_hz": VIZ_HZ,
-        "models": list(BACKENDS.keys()),
-        "default_model": DEFAULT_MODEL,
-        "sam_models": list(SAM_BACKENDS.keys()),
-        "sam_default_model": SAM_DEFAULT_MODEL,
+async def main_async(args) -> None:
+    # ---- Mutable session: cam + shm + seg, rebuildable on source switch ----
+    sess: dict = {
+        "kind": "live",
+        "video": None,
+        "cam": None,
+        "intr": None,
+        "shm": None,
+        "seg": None,
+        "fx_i": 0.0, "fy_i": 0.0, "cx_i": 0.0, "cy_i": 0.0,
     }
+
+    def build_session(kind: str, video_name: str | None) -> None:
+        cam = _make_camera(kind, video_name, args)
+        intr = cam.start()
+        sx = INFER_W / intr.width
+        sy = INFER_H / intr.height
+        shm = create_shm(intr.width, intr.height, INFER_W, INFER_H)
+        seg = create_seg_shm(shm.mesh_grid_w, shm.mesh_grid_h)
+        sess.update(
+            kind=kind, video=video_name,
+            cam=cam, intr=intr, shm=shm, seg=seg,
+            fx_i=intr.fx * sx, fy_i=intr.fy * sy,
+            cx_i=intr.cx * sx, cy_i=intr.cy * sy,
+        )
+
+    def teardown_session() -> None:
+        cam = sess.get("cam")
+        shm = sess.get("shm")
+        seg = sess.get("seg")
+        if cam is not None: cam.stop()
+        if seg is not None:
+            seg.close(); seg.unlink()
+        if shm is not None:
+            shm.close(); shm.unlink()
+
+    build_session(args.source, args.video)
+
+    def make_meta_payload() -> dict:
+        intr = sess["intr"]
+        shm = sess["shm"]
+        return {
+            "rgb_w": intr.width, "rgb_h": intr.height,
+            "infer_w": INFER_W, "infer_h": INFER_H,
+            "fx": intr.fx, "fy": intr.fy, "cx": intr.cx, "cy": intr.cy,
+            "fx_infer": sess["fx_i"], "fy_infer": sess["fy_i"],
+            "cx_infer": sess["cx_i"], "cy_infer": sess["cy_i"],
+            "mesh_grid_w": shm.mesh_grid_w, "mesh_grid_h": shm.mesh_grid_h,
+            "viz_hz": VIZ_HZ,
+            "models": list(BACKENDS.keys()),
+            "default_model": DEFAULT_MODEL,
+            "sam_models": list(SAM_BACKENDS.keys()),
+            "sam_default_model": SAM_DEFAULT_MODEL,
+            "videos": list_videos(),
+            "source": {"kind": sess["kind"], "video": sess["video"]},
+        }
 
     hub = Hub()
     state = {
@@ -267,6 +324,7 @@ async def main_async(args) -> None:
     }
 
     def spawn_depth(model_key: str) -> None:
+        shm = sess["shm"]
         stop_ev  = mp.Event()
         status_q = mp.Queue(maxsize=64)
         proc = mp.Process(
@@ -279,7 +337,7 @@ async def main_async(args) -> None:
                 shm.rgb_seq, shm.depth_seq, shm.pc_count, shm.has_normal,
                 shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
                 shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
-                fx_i, fy_i, cx_i, cy_i,
+                sess["fx_i"], sess["fy_i"], sess["cx_i"], sess["cy_i"],
                 stop_ev, status_q, model_key,
             ),
             daemon=True,
@@ -328,6 +386,8 @@ async def main_async(args) -> None:
         }
 
     def spawn_seg(model_key: str) -> None:
+        shm = sess["shm"]
+        seg = sess["seg"]
         stop_ev  = mp.Event()
         status_q = mp.Queue(maxsize=64)
         proc = mp.Process(
@@ -369,6 +429,7 @@ async def main_async(args) -> None:
         await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
         # Run blocking spawn/stop in a thread so we don't stall the loop.
         await asyncio.to_thread(stop_depth)
+        shm = sess["shm"]
         with shm.pc_count.get_lock():
             shm.pc_count.value = 0
         await asyncio.to_thread(spawn_depth, key)
@@ -381,7 +442,8 @@ async def main_async(args) -> None:
         await hub.broadcast(_frame_sam_state(0, make_sam_state_payload()))
         await asyncio.to_thread(stop_seg)
         # Wipe any current mask so the UI doesn't keep showing an old object.
-        seg_mask[:] = 0
+        seg = sess["seg"]
+        seg.mask_arr()[:] = 0
         with seg.has_mask.get_lock(): seg.has_mask.value = 0
         with seg.mask_seq.get_lock(): seg.mask_seq.value = seg.mask_seq.value + 1
         await asyncio.to_thread(spawn_seg, key)
@@ -392,6 +454,7 @@ async def main_async(args) -> None:
 
     async def on_sam_click(x: int, y: int) -> None:
         # Coordinates arrive in INFERENCE-frame pixels.
+        seg = sess["seg"]
         with seg.click_x.get_lock(): seg.click_x.value = int(x)
         with seg.click_y.get_lock(): seg.click_y.value = int(y)
         with seg.click_seq.get_lock(): seg.click_seq.value = seg.click_seq.value + 1
@@ -399,23 +462,51 @@ async def main_async(args) -> None:
 
     async def on_sam_clear() -> None:
         # Sentinel: negative coords -> worker clears mask.
+        seg = sess["seg"]
         with seg.click_x.get_lock(): seg.click_x.value = -1
         with seg.click_y.get_lock(): seg.click_y.value = -1
         with seg.click_seq.get_lock(): seg.click_seq.value = seg.click_seq.value + 1
         sam_pending_t["t"] = 0.0
 
+    async def on_set_source(kind: str, video_name: str | None) -> None:
+        # No-op if already on this source.
+        if kind == sess["kind"] and video_name == sess["video"]:
+            return
+        # Tear down workers and replace the session, then respawn.
+        await asyncio.to_thread(stop_seg)
+        await asyncio.to_thread(stop_depth)
+        await asyncio.to_thread(teardown_session)
+        try:
+            build_session(kind, video_name)
+        except Exception as exc:
+            print(f"[ws] set_source failed: {exc}", flush=True)
+            # Fall back to live camera.
+            build_session("live", None)
+        # Push the new meta + reset workers.
+        await hub.broadcast(_frame_meta(0, {
+            **make_meta_payload(),
+            "model_state": make_model_state_payload(),
+            "sam_state": make_sam_state_payload(),
+        }))
+        await asyncio.to_thread(spawn_depth, state["model"])
+        await asyncio.to_thread(spawn_seg, sam_state["model"])
+
     spawn_depth(args.model)
     spawn_seg(args.sam_model)
 
     async def ws_loop():
+        def get_meta():
+            return {
+                **make_meta_payload(),
+                "model_state": make_model_state_payload(),
+                "sam_state": make_sam_state_payload(),
+            }
         async with websockets.serve(
             lambda ws: handler(
-                ws, hub,
-                {**meta_payload,
-                 "model_state": make_model_state_payload(),
-                 "sam_state": make_sam_state_payload()},
+                ws, hub, get_meta,
                 on_set_model, on_set_sam_model,
                 on_sam_click, on_sam_clear,
+                on_set_source,
             ),
             args.host, args.port,
             max_size=None, compression=None, ping_interval=20,
@@ -433,6 +524,23 @@ async def main_async(args) -> None:
 
         while True:
             t0 = time.time()
+            # Re-read session each iteration so source-switches take effect
+            # without restarting the loop.
+            cam = sess["cam"]
+            shm = sess["shm"]
+            seg = sess["seg"]
+            rgb_buf = shm.rgb_arr()
+            depth_buf = shm.depth_arr()
+            pc_xyz = shm.pc_xyz_arr()
+            pc_rgb = shm.pc_rgb_arr()
+            pc_grid_idx = shm.pc_grid_idx_arr()
+            mesh_xyz = shm.mesh_xyz_arr()
+            mesh_rgb = shm.mesh_rgb_arr()
+            mesh_faces = shm.mesh_faces_arr()
+            mesh_normal = shm.mesh_normal_arr()
+            normal_img = shm.normal_img_arr()
+            seg_mask = seg.mask_arr()
+            seg_bbox = seg.bbox_arr()
 
             # Drain depth-worker status queue and broadcast.
             sq = state["status_q"]
@@ -580,11 +688,7 @@ async def main_async(args) -> None:
     finally:
         stop_seg()
         stop_depth()
-        cam.stop()
-        seg.close()
-        seg.unlink()
-        shm.close()
-        shm.unlink()
+        teardown_session()
 
 
 def main() -> None:
@@ -595,6 +699,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--sam_model", default=SAM_DEFAULT_MODEL)
+    ap.add_argument("--source", default="live", choices=["live", "video"],
+                    help="Initial input source ('live' uses --camera; 'video' picks --video).")
+    ap.add_argument("--video", default=None,
+                    help="Video filename inside dataset/videos/ to start with.")
     args = ap.parse_args()
     try:
         asyncio.run(main_async(args))

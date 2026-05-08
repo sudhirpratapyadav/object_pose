@@ -31,6 +31,7 @@ export type StreamState = {
   setSamModel: (key: string) => void;
   samClick: (x: number, y: number) => void;
   samClear: () => void;
+  setSource: (kind: "live" | "video", video?: string | null) => void;
 };
 
 export function useStream(url: string): StreamState {
@@ -148,10 +149,15 @@ export function useStream(url: string): StreamState {
   const setSamModel = useCallback((key: string) => send({ set_sam_model: key }), []);
   const samClick = useCallback((x: number, y: number) => send({ sam_click: { x, y } }), []);
   const samClear = useCallback(() => send({ sam_clear: true }), []);
+  const setSource = useCallback(
+    (kind: "live" | "video", video: string | null = null) =>
+      send({ set_source: { kind, video } }),
+    [],
+  );
 
   return {
     meta, modelState, samState, stats,
     pointsRef, meshRef, jpegRef, depthJpegRef, normalJpegRef, maskRef,
-    connected, setModel, setSamModel, samClick, samClear,
+    connected, setModel, setSamModel, samClick, samClear, setSource,
   };
 }

@@ -11,6 +11,9 @@ __pycache__/
 # Model weights (large, downloaded on first run)
 weights/
 
+# Dataset files (big media; not part of the repo)
+datasets/
+
 # IDE
 .vscode/
 .idea/

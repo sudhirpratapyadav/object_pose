@@ -51,6 +51,8 @@ export type Meta = {
   sam_models: string[];
   sam_default_model: string;
   sam_state?: SamState;
+  videos: string[];
+  source: { kind: "live" | "video"; video: string | null };
 };
 
 export type PointsFrame = {

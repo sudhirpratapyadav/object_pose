@@ -95,6 +95,42 @@ export default function App() {
         }
       >
         <div className="row">
+          <div className="label">Source</div>
+          <div className="segmented">
+            <button
+              className={stream.meta?.source.kind === "live" ? "active" : ""}
+              onClick={() => stream.setSource("live")}
+            >
+              live
+            </button>
+            <button
+              className={stream.meta?.source.kind === "video" ? "active" : ""}
+              onClick={() => {
+                const v = stream.meta?.source.video
+                  ?? stream.meta?.videos?.[0]
+                  ?? null;
+                if (v) stream.setSource("video", v);
+              }}
+              disabled={!stream.meta?.videos?.length}
+            >
+              video
+            </button>
+          </div>
+          {stream.meta?.source.kind === "video" && (
+            <select
+              className="select"
+              value={stream.meta?.source.video ?? ""}
+              disabled={!stream.meta?.videos?.length}
+              onChange={(e) => stream.setSource("video", e.target.value)}
+            >
+              {(stream.meta?.videos ?? []).map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div className="row">
           <div className="label">Depth model</div>
           <select
             className="select"
