@@ -135,12 +135,39 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     const points = new THREE.Points(pointsGeom, pointsMat);
     scene.add(points);
 
-    // Mesh
+    // Mesh — custom ShaderMaterial so we can tint masked vertices the same
+    // way the points are tinted.
     const meshGeom = new THREE.BufferGeometry();
     meshGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
     meshGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
+    meshGeom.setAttribute("mask", new THREE.BufferAttribute(new Float32Array(0), 1));
     meshGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(0), 1));
-    const meshMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    const meshMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uHighlight: uniforms.uHighlight,
+        uHighlightAmt: uniforms.uHighlightAmt,
+      },
+      vertexShader: /* glsl */ `
+        attribute vec3 color;
+        attribute float mask;
+        varying vec3 vColor;
+        varying float vMask;
+        void main() {
+          vColor = color;
+          vMask = mask;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: /* glsl */ `
+        varying vec3 vColor;
+        varying float vMask;
+        uniform vec3 uHighlight;
+        uniform float uHighlightAmt;
+        void main() {
+          vec3 c = mix(vColor, uHighlight, vMask * uHighlightAmt);
+          gl_FragColor = vec4(c, 1.0);
+        }`,
+      side: THREE.DoubleSide,
+    });
     const mesh = new THREE.Mesh(meshGeom, meshMat);
     scene.add(mesh);
 
@@ -217,8 +244,15 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         lastMeshSeq = mf.seq;
         const colorsF = new Float32Array(mf.nv * 3);
         for (let i = 0; i < mf.nv * 3; i++) colorsF[i] = mf.rgb[i] / 255;
+        // Mesh-grid mask: identity index into the most recent SAM mask.
+        const msrc = streamRef.current.maskRef.current;
+        const maskF = new Float32Array(mf.nv);
+        if (msrc && msrc.mask.length === mf.nv) {
+          for (let i = 0; i < mf.nv; i++) maskF[i] = msrc.mask[i] ? 1.0 : 0.0;
+        }
         meshGeom.setAttribute("position", new THREE.BufferAttribute(mf.xyz, 3));
         meshGeom.setAttribute("color", new THREE.BufferAttribute(colorsF, 3));
+        meshGeom.setAttribute("mask", new THREE.BufferAttribute(maskF, 1));
         meshGeom.setIndex(new THREE.BufferAttribute(mf.faces, 1));
         meshGeom.computeBoundingSphere();
       }
