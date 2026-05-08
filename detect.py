@@ -55,8 +55,10 @@ def main():
             target=depth_worker,
             args=(
                 shm.rgb.name, shm.depth.name, shm.pc_xyz.name, shm.pc_rgb.name,
+                shm.mesh_xyz.name, shm.mesh_rgb.name, shm.mesh_faces.name,
                 shm.rgb_seq, shm.depth_seq, shm.pc_count,
                 shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
+                shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
                 fx_i, fy_i, cx_i, cy_i,
                 stop_ev,
                 status_q,
@@ -98,12 +100,15 @@ def main():
 
     viewer.set_model_change_callback(on_model_change)
 
-    print("Open http://localhost:8080 — Ctrl+C to quit.")
+    print("Open http://localhost:8090 — Ctrl+C to quit.")
 
     rgb_buf   = shm.rgb_arr()
     depth_buf = shm.depth_arr()
     pc_xyz    = shm.pc_xyz_arr()
     pc_rgb    = shm.pc_rgb_arr()
+    mesh_xyz   = shm.mesh_xyz_arr()
+    mesh_rgb   = shm.mesh_rgb_arr()
+    mesh_faces = shm.mesh_faces_arr()
 
     period = 1.0 / VIZ_HZ
     last_depth_seq = 0
@@ -144,6 +149,7 @@ def main():
                     n = shm.pc_count.value
                 if n > 0:
                     viewer.update_point_cloud(pc_xyz[:n].copy(), pc_rgb[:n].copy())
+                    viewer.update_mesh(mesh_xyz.copy(), mesh_faces.copy(), mesh_rgb.copy())
                     n_pc += 1
                 n_depth += 1
 

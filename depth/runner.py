@@ -21,9 +21,12 @@ import numpy as np
 from PIL import Image
 
 from .backends import DEFAULT_MODEL, make_backend
+from .mesh import build_faces, fill_mesh, grid_dims, precompute_unproject
 
 PC_DOWNSAMPLE = 4
 PC_MIN_M, PC_MAX_M = 0.05, 10.0
+MESH_DOWNSAMPLE = 4
+MESH_EDGE_THRESHOLD_M = 0.05
 
 
 @dataclass
@@ -32,6 +35,9 @@ class DepthShm:
     depth:  shared_memory.SharedMemory
     pc_xyz: shared_memory.SharedMemory
     pc_rgb: shared_memory.SharedMemory
+    mesh_xyz:   shared_memory.SharedMemory
+    mesh_rgb:   shared_memory.SharedMemory
+    mesh_faces: shared_memory.SharedMemory
     rgb_seq:   mp.Value
     depth_seq: mp.Value
     pc_count:  mp.Value
@@ -40,6 +46,9 @@ class DepthShm:
     infer_w:  int
     infer_h:  int
     n_max:    int
+    mesh_grid_w: int
+    mesh_grid_h: int
+    mesh_n_faces: int
 
     def rgb_arr(self) -> np.ndarray:
         return np.ndarray((self.rgb_h, self.rgb_w, 3), dtype=np.uint8, buffer=self.rgb.buf)
@@ -53,29 +62,51 @@ class DepthShm:
     def pc_rgb_arr(self) -> np.ndarray:
         return np.ndarray((self.n_max, 3), dtype=np.uint8, buffer=self.pc_rgb.buf)
 
+    def mesh_xyz_arr(self) -> np.ndarray:
+        n = self.mesh_grid_w * self.mesh_grid_h
+        return np.ndarray((n, 3), dtype=np.float32, buffer=self.mesh_xyz.buf)
+
+    def mesh_rgb_arr(self) -> np.ndarray:
+        n = self.mesh_grid_w * self.mesh_grid_h
+        return np.ndarray((n, 3), dtype=np.float32, buffer=self.mesh_rgb.buf)
+
+    def mesh_faces_arr(self) -> np.ndarray:
+        return np.ndarray((self.mesh_n_faces, 3), dtype=np.int32, buffer=self.mesh_faces.buf)
+
     def close(self):
-        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb):
+        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
             shm.close()
 
     def unlink(self):
-        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb):
+        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
             try: shm.unlink()
             except FileNotFoundError: pass
 
 
 def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
     n_max = (infer_w // PC_DOWNSAMPLE) * (infer_h // PC_DOWNSAMPLE)
+    grid_w, grid_h = grid_dims(infer_w, infer_h, MESH_DOWNSAMPLE)
+    n_verts = grid_w * grid_h
+    n_faces = 2 * (grid_h - 1) * (grid_w - 1)
+
     rgb    = shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w * 3)
     depth  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 4)
     pc_xyz = shared_memory.SharedMemory(create=True, size=n_max * 3 * 4)
     pc_rgb = shared_memory.SharedMemory(create=True, size=n_max * 3)
+    mesh_xyz   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
+    mesh_rgb   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
+    mesh_faces = shared_memory.SharedMemory(create=True, size=n_faces * 3 * 4)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
+        mesh_xyz=mesh_xyz, mesh_rgb=mesh_rgb, mesh_faces=mesh_faces,
         rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
         pc_count=mp.Value("I", 0),
         rgb_w=rgb_w, rgb_h=rgb_h,
         infer_w=infer_w, infer_h=infer_h, n_max=n_max,
+        mesh_grid_w=grid_w, mesh_grid_h=grid_h, mesh_n_faces=n_faces,
     )
 
 
@@ -85,8 +116,10 @@ def _open_existing(name: str) -> shared_memory.SharedMemory:
 
 def depth_worker(
     rgb_name: str, depth_name: str, pc_xyz_name: str, pc_rgb_name: str,
+    mesh_xyz_name: str, mesh_rgb_name: str, mesh_faces_name: str,
     rgb_seq, depth_seq, pc_count,
     rgb_w: int, rgb_h: int, infer_w: int, infer_h: int, n_max: int,
+    mesh_grid_w: int, mesh_grid_h: int, mesh_n_faces: int,
     fx: float, fy: float, cx: float, cy: float,
     stop_ev,
     status_q=None,
@@ -105,11 +138,21 @@ def depth_worker(
     depth_shm  = _open_existing(depth_name)
     pc_xyz_shm = _open_existing(pc_xyz_name)
     pc_rgb_shm = _open_existing(pc_rgb_name)
+    mesh_xyz_shm   = _open_existing(mesh_xyz_name)
+    mesh_rgb_shm   = _open_existing(mesh_rgb_name)
+    mesh_faces_shm = _open_existing(mesh_faces_name)
 
     rgb_arr    = np.ndarray((rgb_h, rgb_w, 3),  dtype=np.uint8,   buffer=rgb_shm.buf)
     depth_arr  = np.ndarray((infer_h, infer_w), dtype=np.float32, buffer=depth_shm.buf)
     pc_xyz_arr = np.ndarray((n_max, 3),         dtype=np.float32, buffer=pc_xyz_shm.buf)
     pc_rgb_arr = np.ndarray((n_max, 3),         dtype=np.uint8,   buffer=pc_rgb_shm.buf)
+    n_verts    = mesh_grid_w * mesh_grid_h
+    mesh_xyz_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_xyz_shm.buf)
+    mesh_rgb_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_rgb_shm.buf)
+    mesh_faces_arr = np.ndarray((mesh_n_faces, 3),  dtype=np.int32,   buffer=mesh_faces_shm.buf)
+
+    all_shms = (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm,
+                mesh_xyz_shm, mesh_rgb_shm, mesh_faces_shm)
 
     try:
         backend = make_backend(model_key, focal_px=float(fx))
@@ -121,7 +164,7 @@ def depth_worker(
         # Stay alive so the GUI can switch to a different backend
         while not stop_ev.is_set():
             time.sleep(0.1)
-        for shm in (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm):
+        for shm in all_shms:
             shm.close()
         return
 
@@ -132,6 +175,12 @@ def depth_worker(
     uu, vv = np.meshgrid(u, v)
     x_norm = (uu - cx) / fx
     y_norm = (vv - cy) / fy
+
+    # Static mesh topology + back-projection lookups.
+    mesh_faces_static = build_faces(mesh_grid_w, mesh_grid_h)
+    mesh_x_norm, mesh_y_norm = precompute_unproject(
+        mesh_grid_w, mesh_grid_h, MESH_DOWNSAMPLE, fx, fy, cx, cy,
+    )
 
     last_seen = 0
     while not stop_ev.is_set():
@@ -165,10 +214,21 @@ def depth_worker(
         depth_arr[...] = d
         pc_xyz_arr[:n] = pts[:n]
         pc_rgb_arr[:n] = cols[:n]
+
+        fill_mesh(
+            d, rgb_inf,
+            mesh_x_norm, mesh_y_norm,
+            mesh_faces_static,
+            MESH_DOWNSAMPLE,
+            PC_MIN_M, PC_MAX_M,
+            MESH_EDGE_THRESHOLD_M,
+            mesh_xyz_arr, mesh_rgb_arr, mesh_faces_arr,
+        )
+
         with pc_count.get_lock():
             pc_count.value = n
         with depth_seq.get_lock():
             depth_seq.value = depth_seq.value + 1
 
-    for shm in (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm):
+    for shm in all_shms:
         shm.close()
