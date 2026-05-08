@@ -14,6 +14,7 @@ export default function App() {
   const [showBBox, setShowBBox] = useState(false);
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [depthUrl, setDepthUrl] = useState<string | null>(null);
+  const [normalUrl, setNormalUrl] = useState<string | null>(null);
   const [hideHud, setHideHud] = useState(false);
 
   // Press H to toggle HUD panels (status pills stay).
@@ -30,7 +31,7 @@ export default function App() {
   // Pull blob-url state from refs at ~30fps without re-rendering everything.
   useEffect(() => {
     let alive = true;
-    let lastRgb = -1, lastDepth = -1;
+    let lastRgb = -1, lastDepth = -1, lastNormal = -1;
     const tick = () => {
       const j = stream.jpegRef.current;
       if (j.seq !== lastRgb && j.blobUrl) {
@@ -41,6 +42,11 @@ export default function App() {
       if (d.seq !== lastDepth && d.blobUrl) {
         lastDepth = d.seq;
         setDepthUrl(d.blobUrl);
+      }
+      const n = stream.normalJpegRef.current;
+      if (n.seq !== lastNormal && n.blobUrl) {
+        lastNormal = n.seq;
+        setNormalUrl(n.blobUrl);
       }
       if (alive) raf = requestAnimationFrame(tick);
     };
@@ -206,6 +212,22 @@ export default function App() {
             </div>
           ) : <div className="help">—</div>}
         </div>
+
+        {stream.modelState?.has_normals && (
+          <div className="row">
+            <div className="label">Normals</div>
+            {normalUrl ? (
+              <div className="img-frame">
+                <img src={normalUrl} className="thumb" />
+                <span className="badge">
+                  <span className="dim">
+                    {stream.meta ? `${stream.meta.infer_w}×${stream.meta.infer_h}` : ""}
+                  </span>
+                </span>
+              </div>
+            ) : <div className="help">—</div>}
+          </div>
+        )}
 
         <button className="button accent" onClick={() => stream.samClear()}>
           Clear selection

@@ -39,9 +39,12 @@ class DepthShm:
     mesh_xyz:   shared_memory.SharedMemory
     mesh_rgb:   shared_memory.SharedMemory
     mesh_faces: shared_memory.SharedMemory
+    mesh_normal: shared_memory.SharedMemory  # (n_verts, 3) float32, may be all zeros
+    normal_img: shared_memory.SharedMemory   # (infer_h, infer_w, 3) float32 normal map
     rgb_seq:   mp.Value
     depth_seq: mp.Value
     pc_count:  mp.Value
+    has_normal: mp.Value
     rgb_w:    int
     rgb_h:    int
     infer_w:  int
@@ -77,16 +80,26 @@ class DepthShm:
     def mesh_faces_arr(self) -> np.ndarray:
         return np.ndarray((self.mesh_n_faces, 3), dtype=np.int32, buffer=self.mesh_faces.buf)
 
+    def mesh_normal_arr(self) -> np.ndarray:
+        n = self.mesh_grid_w * self.mesh_grid_h
+        return np.ndarray((n, 3), dtype=np.float32, buffer=self.mesh_normal.buf)
+
+    def normal_img_arr(self) -> np.ndarray:
+        return np.ndarray((self.infer_h, self.infer_w, 3), dtype=np.float32,
+                          buffer=self.normal_img.buf)
+
     def close(self):
         for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
                     self.pc_grid_idx,
-                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
+                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
+                    self.mesh_normal, self.normal_img):
             shm.close()
 
     def unlink(self):
         for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
                     self.pc_grid_idx,
-                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces):
+                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
+                    self.mesh_normal, self.normal_img):
             try: shm.unlink()
             except FileNotFoundError: pass
 
@@ -105,13 +118,17 @@ def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
     mesh_xyz   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     mesh_rgb   = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     mesh_faces = shared_memory.SharedMemory(create=True, size=n_faces * 3 * 4)
+    mesh_normal = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
+    normal_img  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 3 * 4)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
         pc_grid_idx=pc_grid_idx,
         mesh_xyz=mesh_xyz, mesh_rgb=mesh_rgb, mesh_faces=mesh_faces,
+        mesh_normal=mesh_normal, normal_img=normal_img,
         rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
         pc_count=mp.Value("I", 0),
+        has_normal=mp.Value("B", 0),
         rgb_w=rgb_w, rgb_h=rgb_h,
         infer_w=infer_w, infer_h=infer_h, n_max=n_max,
         mesh_grid_w=grid_w, mesh_grid_h=grid_h, mesh_n_faces=n_faces,
@@ -126,7 +143,8 @@ def depth_worker(
     rgb_name: str, depth_name: str, pc_xyz_name: str, pc_rgb_name: str,
     pc_grid_idx_name: str,
     mesh_xyz_name: str, mesh_rgb_name: str, mesh_faces_name: str,
-    rgb_seq, depth_seq, pc_count,
+    mesh_normal_name: str, normal_img_name: str,
+    rgb_seq, depth_seq, pc_count, has_normal_flag,
     rgb_w: int, rgb_h: int, infer_w: int, infer_h: int, n_max: int,
     mesh_grid_w: int, mesh_grid_h: int, mesh_n_faces: int,
     fx: float, fy: float, cx: float, cy: float,
@@ -151,6 +169,8 @@ def depth_worker(
     mesh_xyz_shm   = _open_existing(mesh_xyz_name)
     mesh_rgb_shm   = _open_existing(mesh_rgb_name)
     mesh_faces_shm = _open_existing(mesh_faces_name)
+    mesh_normal_shm = _open_existing(mesh_normal_name)
+    normal_img_shm  = _open_existing(normal_img_name)
 
     rgb_arr    = np.ndarray((rgb_h, rgb_w, 3),  dtype=np.uint8,   buffer=rgb_shm.buf)
     depth_arr  = np.ndarray((infer_h, infer_w), dtype=np.float32, buffer=depth_shm.buf)
@@ -161,9 +181,13 @@ def depth_worker(
     mesh_xyz_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_xyz_shm.buf)
     mesh_rgb_arr   = np.ndarray((n_verts, 3),       dtype=np.float32, buffer=mesh_rgb_shm.buf)
     mesh_faces_arr = np.ndarray((mesh_n_faces, 3),  dtype=np.int32,   buffer=mesh_faces_shm.buf)
+    mesh_normal_arr = np.ndarray((n_verts, 3),      dtype=np.float32, buffer=mesh_normal_shm.buf)
+    normal_img_arr  = np.ndarray((infer_h, infer_w, 3), dtype=np.float32,
+                                 buffer=normal_img_shm.buf)
 
     all_shms = (rgb_shm, depth_shm, pc_xyz_shm, pc_rgb_shm, pc_grid_idx_shm,
-                mesh_xyz_shm, mesh_rgb_shm, mesh_faces_shm)
+                mesh_xyz_shm, mesh_rgb_shm, mesh_faces_shm,
+                mesh_normal_shm, normal_img_shm)
 
     try:
         backend = make_backend(model_key, focal_px=float(fx))
@@ -206,7 +230,11 @@ def depth_worker(
         rgb_pil  = Image.fromarray(rgb_full).resize((infer_w, infer_h), Image.BILINEAR)
         rgb_inf  = np.asarray(rgb_pil)
 
-        d = backend.infer(rgb_inf)
+        out = backend.infer(rgb_inf)
+        if isinstance(out, tuple):
+            d, n_img = out
+        else:
+            d, n_img = out, None
         d = np.clip(d.astype(np.float32), 0.0, PC_MAX_M)
         if d.shape != (infer_h, infer_w):
             d = np.asarray(Image.fromarray(d).resize((infer_w, infer_h), Image.BILINEAR))
@@ -231,6 +259,9 @@ def depth_worker(
         pc_rgb_arr[:n] = cols[:n]
         pc_grid_idx_arr[:n] = flat_idx[:n]
 
+        n_grid_for_fill = None
+        if n_img is not None and n_img.shape[:2] == (infer_h, infer_w):
+            n_grid_for_fill = n_img[::MESH_DOWNSAMPLE, ::MESH_DOWNSAMPLE]
         fill_mesh(
             d, rgb_inf,
             mesh_x_norm, mesh_y_norm,
@@ -239,7 +270,25 @@ def depth_worker(
             PC_MIN_M, PC_MAX_M,
             MESH_EDGE_THRESHOLD_M,
             mesh_xyz_arr, mesh_rgb_arr, mesh_faces_arr,
+            normal_grid=n_grid_for_fill,
         )
+
+        # Normals: write the inference-frame map to normal_img and the
+        # downsampled grid to mesh_normal. has_normal toggles per frame.
+        if n_img is not None:
+            if n_img.shape[:2] != (infer_h, infer_w):
+                from PIL import Image as _I
+                ch = []
+                for c in range(3):
+                    ch.append(np.asarray(_I.fromarray(n_img[..., c]).resize(
+                        (infer_w, infer_h), _I.BILINEAR)))
+                n_img = np.stack(ch, axis=-1)
+            normal_img_arr[...] = n_img.astype(np.float32)
+            n_grid = n_img[::MESH_DOWNSAMPLE, ::MESH_DOWNSAMPLE]
+            mesh_normal_arr[...] = n_grid.reshape(-1, 3).astype(np.float32)
+            with has_normal_flag.get_lock(): has_normal_flag.value = 1
+        else:
+            with has_normal_flag.get_lock(): has_normal_flag.value = 0
 
         with pc_count.get_lock():
             pc_count.value = n

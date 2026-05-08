@@ -135,36 +135,57 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     const points = new THREE.Points(pointsGeom, pointsMat);
     scene.add(points);
 
-    // Mesh — custom ShaderMaterial so we can tint masked vertices the same
-    // way the points are tinted.
+    // Mesh — custom ShaderMaterial:
+    //   - tints masked vertices toward uHighlight (same as points)
+    //   - optionally Lambert-shades using a per-vertex 'normal' attribute
+    //     when the model provides normals (uUseNormals = 1.0).
     const meshGeom = new THREE.BufferGeometry();
     meshGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
     meshGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
     meshGeom.setAttribute("mask", new THREE.BufferAttribute(new Float32Array(0), 1));
+    // aNormal attribute is only attached once mesh data with normals arrives.
     meshGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(0), 1));
     const meshMat = new THREE.ShaderMaterial({
       uniforms: {
         uHighlight: uniforms.uHighlight,
         uHighlightAmt: uniforms.uHighlightAmt,
+        uUseNormals: { value: 0.0 },
+        // Light direction in camera frame (over-the-shoulder default).
+        uLightDir: { value: new THREE.Vector3(0.4, -0.6, -0.7).normalize() },
+        uAmbient:  { value: 0.35 },
       },
       vertexShader: /* glsl */ `
         attribute vec3 color;
         attribute float mask;
+        attribute vec3 aNormal;
         varying vec3 vColor;
         varying float vMask;
+        varying vec3 vNormal;
         void main() {
           vColor = color;
           vMask = mask;
+          vNormal = aNormal;
           gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
         }`,
       fragmentShader: /* glsl */ `
         varying vec3 vColor;
         varying float vMask;
+        varying vec3 vNormal;
         uniform vec3 uHighlight;
         uniform float uHighlightAmt;
+        uniform float uUseNormals;
+        uniform vec3 uLightDir;
+        uniform float uAmbient;
         void main() {
           vec3 c = mix(vColor, uHighlight, vMask * uHighlightAmt);
-          gl_FragColor = vec4(c, 1.0);
+          // If we have normals, Lambert-shade; else pass color through.
+          float lit = 1.0;
+          if (uUseNormals > 0.5) {
+            vec3 n = normalize(vNormal);
+            float ndotl = abs(dot(n, uLightDir));
+            lit = uAmbient + (1.0 - uAmbient) * ndotl;
+          }
+          gl_FragColor = vec4(c * lit, 1.0);
         }`,
       side: THREE.DoubleSide,
     });
@@ -319,6 +340,15 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         meshGeom.setAttribute("position", new THREE.BufferAttribute(mf.xyz, 3));
         meshGeom.setAttribute("color", new THREE.BufferAttribute(colorsF, 3));
         meshGeom.setAttribute("mask", new THREE.BufferAttribute(maskF, 1));
+        // Only attach normals when the backend ships them; otherwise remove
+        // the attribute so a previous lit-mode mesh doesn't keep stale data.
+        if (mf.normal && mf.normal.length === mf.nv * 3) {
+          meshGeom.setAttribute("aNormal", new THREE.BufferAttribute(mf.normal as Float32Array, 3));
+          meshMat.uniforms.uUseNormals.value = 1.0;
+        } else {
+          if (meshGeom.getAttribute("aNormal")) meshGeom.deleteAttribute("aNormal");
+          meshMat.uniforms.uUseNormals.value = 0.0;
+        }
         meshGeom.setIndex(new THREE.BufferAttribute(mf.faces, 1));
         meshGeom.computeBoundingSphere();
       }

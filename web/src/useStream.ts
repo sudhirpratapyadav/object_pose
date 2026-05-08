@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Frame, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH, KIND_META,
-  KIND_MODEL_STATE, KIND_POINTS, KIND_SAM_STATE, KIND_STATS, Meta, ModelState,
-  SamState, Stats, parseFrame,
+  KIND_MODEL_STATE, KIND_NORMAL_JPEG, KIND_POINTS, KIND_SAM_STATE, KIND_STATS,
+  Meta, ModelState, SamState, Stats, parseFrame,
 } from "./protocol";
 
 type JpegRef = React.MutableRefObject<{ blobUrl: string | null; seq: number }>;
@@ -21,9 +21,10 @@ export type StreamState = {
   samState: SamState | null;
   stats: Stats | null;
   pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
-  meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; nv: number; nf: number; seq: number } | null>;
+  meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; normal: Float32Array | null; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
   depthJpegRef: JpegRef;
+  normalJpegRef: JpegRef;
   maskRef: React.MutableRefObject<MaskData | null>;
   connected: boolean;
   setModel: (key: string) => void;
@@ -44,6 +45,7 @@ export function useStream(url: string): StreamState {
   const meshRef = useRef<StreamState["meshRef"]["current"]>(null);
   const jpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
   const depthJpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
+  const normalJpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
   const maskRef = useRef<MaskData | null>(null);
 
   useEffect(() => {
@@ -113,6 +115,7 @@ export function useStream(url: string): StreamState {
               xyz: frame.xyz as unknown as Float32Array,
               rgb: frame.rgb,
               faces: frame.faces,
+              normal: (frame.normal as unknown as Float32Array | null),
               nv: frame.nv,
               nf: frame.nf,
               seq: frame.seq,
@@ -123,6 +126,9 @@ export function useStream(url: string): StreamState {
             break;
           case KIND_DEPTH_JPEG:
             setBlob(depthJpegRef, frame.bytes, frame.seq);
+            break;
+          case KIND_NORMAL_JPEG:
+            setBlob(normalJpegRef, frame.bytes, frame.seq);
             break;
         }
       };
@@ -145,7 +151,7 @@ export function useStream(url: string): StreamState {
 
   return {
     meta, modelState, samState, stats,
-    pointsRef, meshRef, jpegRef, depthJpegRef, maskRef,
+    pointsRef, meshRef, jpegRef, depthJpegRef, normalJpegRef, maskRef,
     connected, setModel, setSamModel, samClick, samClear,
   };
 }

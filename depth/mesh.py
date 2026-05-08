@@ -63,6 +63,8 @@ def fill_mesh(
     out_xyz: np.ndarray,          # (grid_h*grid_w, 3) float32 — written
     out_rgb: np.ndarray,          # (grid_h*grid_w, 3) float32 — written, [0..1]
     out_faces: np.ndarray,        # (M, 3) int32 — written (collapsed copy)
+    normal_grid: "np.ndarray | None" = None,    # (grid_h, grid_w, 3) float32
+    normal_cos_threshold: float = 0.5,          # cos(60°) = 0.5; lower angle → tighter
 ) -> None:
     z = depth[::ds, ::ds]
     h, w = z.shape
@@ -102,6 +104,26 @@ def fill_mesh(
         & (np.abs(zb - zd) < et)
         & (np.abs(zc - zd) < et)
     )
+
+    # Optional normal-angle test: drop triangles whose vertex normals diverge
+    # too much (i.e. cross a surface boundary). Cheap dot products on already
+    # unit-length vectors.
+    if normal_grid is not None and normal_grid.shape[:2] == (h, w):
+        na = normal_grid[:-1, :-1].reshape(-1, 3)
+        nb = normal_grid[:-1, 1: ].reshape(-1, 3)
+        nc = normal_grid[1: , :-1].reshape(-1, 3)
+        nd = normal_grid[1: , 1: ].reshape(-1, 3)
+        ct = normal_cos_threshold
+        keep1 &= (
+            (np.einsum("ij,ij->i", na, nb) > ct)
+            & (np.einsum("ij,ij->i", na, nc) > ct)
+            & (np.einsum("ij,ij->i", nb, nc) > ct)
+        )
+        keep2 &= (
+            (np.einsum("ij,ij->i", nb, nc) > ct)
+            & (np.einsum("ij,ij->i", nb, nd) > ct)
+            & (np.einsum("ij,ij->i", nc, nd) > ct)
+        )
 
     out_faces[...] = faces_static
     # Collapse rejected triangles to (0, 0, 0) — degenerate, GPU culls.

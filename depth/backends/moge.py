@@ -56,25 +56,46 @@ class MoGeBackend:
         print(f"[depth] {self.info.key} ready in {time.time()-t0:.1f}s", flush=True)
         status("ready")
 
-    def infer(self, rgb: np.ndarray) -> np.ndarray:
+    def infer(self, rgb: np.ndarray):
         import torch
         # MoGe expects (3, H, W) float in [0, 1].
         rgb_t = torch.from_numpy(rgb).to(self._device).permute(2, 0, 1).float() / 255.0
         with torch.no_grad():
             out = self._model.infer(rgb_t)
-        # out is a dict; use 'depth' if present, else derive from 'points' z.
+
+        # Depth
         if "depth" in out and out["depth"] is not None:
             d = out["depth"]
         else:
             d = out["points"][..., 2]
         d = d.detach().cpu().numpy().astype(np.float32)
-        # Replace NaNs/inf (invalid pixels) with 0 — pipeline filters z<=0.
         d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
         if d.shape != (self.info.infer_h, self.info.infer_w):
             from PIL import Image as _I
             d = np.asarray(_I.fromarray(d).resize(
                 (self.info.infer_w, self.info.infer_h), _I.BILINEAR))
-        return d
+
+        # Normals (only the *-normal MoGe variants emit these)
+        n_arr = None
+        if self.info.has_normals and "normal" in out and out["normal"] is not None:
+            n = out["normal"].detach().cpu().numpy().astype(np.float32)
+            # Expect (H, W, 3); some versions ship (3, H, W).
+            if n.ndim == 3 and n.shape[0] == 3:
+                n = np.transpose(n, (1, 2, 0))
+            n = np.nan_to_num(n, nan=0.0, posinf=0.0, neginf=0.0)
+            if n.shape[:2] != (self.info.infer_h, self.info.infer_w):
+                # Resize per-channel (rare; output usually matches infer dims)
+                from PIL import Image as _I
+                ch = []
+                for c in range(3):
+                    ch.append(np.asarray(_I.fromarray(n[..., c]).resize(
+                        (self.info.infer_w, self.info.infer_h), _I.BILINEAR)))
+                n = np.stack(ch, axis=-1)
+            # Re-normalize to unit vectors.
+            norm = np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8
+            n_arr = (n / norm).astype(np.float32)
+
+        return (d, n_arr) if n_arr is not None else d
 
 
 def _download_snapshot(repo: str, wdir: Path, status: StatusFn) -> None:

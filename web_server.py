@@ -49,6 +49,7 @@ KIND_MODEL_STATE = 5  # current depth model + status text + progress
 KIND_MASK        = 6  # SAM2 mask (per-point) + AABB
 KIND_SAM_STATE   = 7  # current SAM2 model + status
 KIND_STATS       = 8  # 1 Hz live stats: rgb fps, depth fps, sam_ms
+KIND_NORMAL_JPEG = 9  # colorized surface-normal image
 
 
 def _pack_header(seq: int, kind: int) -> bytes:
@@ -78,14 +79,19 @@ def _frame_points(seq: int, xyz: np.ndarray, rgb: np.ndarray,
 
 
 def _frame_mesh(seq: int, xyz: np.ndarray, rgb: np.ndarray,
-                faces: np.ndarray) -> bytes:
-    return (
-        _pack_header(seq, KIND_MESH)
-        + struct.pack("<II", xyz.shape[0], faces.shape[0])
+                faces: np.ndarray, normal: np.ndarray | None = None) -> bytes:
+    """Layout: header | nv u32 | nf u32 | has_normal u8 | xyz_f16 [3nv]
+       | rgb_u8 [3nv] | faces_u32 [3nf] | normal_f16 [3nv if has_normal]."""
+    has_n = 1 if normal is not None else 0
+    body = (
+        struct.pack("<IIB", xyz.shape[0], faces.shape[0], has_n)
         + _f32_to_f16_bytes(xyz)
         + (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8).tobytes()
         + faces.astype(np.uint32).tobytes()
     )
+    if has_n:
+        body += _f32_to_f16_bytes(normal.astype(np.float32))
+    return _pack_header(seq, KIND_MESH) + body
 
 
 def _frame_jpeg(seq: int, bgr: np.ndarray, kind: int = KIND_JPEG,
@@ -132,6 +138,12 @@ def _depth_to_turbo_bgr(depth_m: np.ndarray, dmax: float = 6.0) -> np.ndarray:
     d = np.clip(depth_m, 0.0, dmax)
     u8 = (d / max(dmax, 1e-3) * 255.0).astype(np.uint8)
     return cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
+
+
+def _normal_to_bgr(n_img: np.ndarray) -> np.ndarray:
+    """Standard normal-map visualization: (n+1)/2 in 0..255, RGB then BGR."""
+    rgb = ((np.clip(n_img, -1.0, 1.0) + 1.0) * 0.5 * 255.0).astype(np.uint8)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 class Hub:
@@ -217,6 +229,8 @@ async def main_async(args) -> None:
     mesh_xyz   = shm.mesh_xyz_arr()
     mesh_rgb   = shm.mesh_rgb_arr()
     mesh_faces = shm.mesh_faces_arr()
+    mesh_normal = shm.mesh_normal_arr()
+    normal_img  = shm.normal_img_arr()
     seg_mask   = seg.mask_arr()
     seg_bbox   = seg.bbox_arr()
 
@@ -261,7 +275,8 @@ async def main_async(args) -> None:
                 shm.rgb.name, shm.depth.name, shm.pc_xyz.name, shm.pc_rgb.name,
                 shm.pc_grid_idx.name,
                 shm.mesh_xyz.name, shm.mesh_rgb.name, shm.mesh_faces.name,
-                shm.rgb_seq, shm.depth_seq, shm.pc_count,
+                shm.mesh_normal.name, shm.normal_img.name,
+                shm.rgb_seq, shm.depth_seq, shm.pc_count, shm.has_normal,
                 shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
                 shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
                 fx_i, fy_i, cx_i, cy_i,
@@ -286,12 +301,23 @@ async def main_async(args) -> None:
                 try: state["status_q"].get_nowait()
                 except Exception: break
 
+    def _model_has_normals(key: str) -> bool:
+        # Probe BackendInfo without instantiating the backend.
+        factory = BACKENDS.get(key)
+        if factory is None:
+            return False
+        try:
+            return bool(factory(1.0).info.has_normals)
+        except Exception:
+            return False
+
     def make_model_state_payload() -> dict:
         return {
             "model": state["model"],
             "status": state["model_status"],
             "progress": state["model_progress"],
             "file": state["model_file"],
+            "has_normals": _model_has_normals(state["model"]),
         }
 
     def make_sam_state_payload() -> dict:
@@ -480,6 +506,9 @@ async def main_async(args) -> None:
                 last_depth_seq = cur
                 with shm.pc_count.get_lock():
                     n = shm.pc_count.value
+                with shm.has_normal.get_lock():
+                    have_n = bool(shm.has_normal.value)
+                normal_payload = mesh_normal.copy() if have_n else None
                 if n > 0:
                     pc_mask = seg_mask[pc_grid_idx[:n]].copy()
                     await hub.broadcast(
@@ -489,7 +518,7 @@ async def main_async(args) -> None:
                     seq += 1
                     await hub.broadcast(
                         _frame_mesh(seq, mesh_xyz.copy(), mesh_rgb.copy(),
-                                    mesh_faces.copy())
+                                    mesh_faces.copy(), normal=normal_payload)
                     )
                     seq += 1
                 # Always send a colorized depth jpeg, even when pc is empty.
@@ -498,6 +527,13 @@ async def main_async(args) -> None:
                     _frame_jpeg(seq, depth_bgr, kind=KIND_DEPTH_JPEG, quality=80)
                 )
                 seq += 1
+                # And a normal-map jpeg if the model produces normals.
+                if have_n:
+                    normal_bgr = _normal_to_bgr(normal_img)
+                    await hub.broadcast(
+                        _frame_jpeg(seq, normal_bgr, kind=KIND_NORMAL_JPEG, quality=80)
+                    )
+                    seq += 1
                 n_depth += 1
 
             # Broadcast a mask frame whenever the SAM worker bumps mask_seq.

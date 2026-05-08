@@ -42,10 +42,12 @@ def _metric3d(key: str, hub_entry: str, label: str,
 
 
 def _moge(key: str, repo: str, label: str,
-          infer_w: int = 640, infer_h: int = 480) -> Callable[[float], DepthBackend]:
+          infer_w: int = 640, infer_h: int = 480,
+          has_normals: bool = False) -> Callable[[float], DepthBackend]:
     info = BackendInfo(
         key=key, label=label, family="moge",
         repo=repo, infer_w=infer_w, infer_h=infer_h,
+        has_normals=has_normals,
     )
     return lambda focal_px: MoGeBackend(info, WEIGHTS_ROOT)
 
@@ -70,13 +72,16 @@ BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
                                      "Metric3D V2 ViT-L"),
     "moge-2-vits-normal":  _moge("moge-2-vits-normal",
                                  "Ruicheng/moge-2-vits-normal",
-                                 "MoGe-2 ViT-S + normal"),
+                                 "MoGe-2 ViT-S + normal",
+                                 has_normals=True),
     "moge-2-vitl":         _moge("moge-2-vitl",
                                  "Ruicheng/moge-2-vitl",
-                                 "MoGe-2 ViT-L"),
+                                 "MoGe-2 ViT-L",
+                                 has_normals=False),
     "moge-2-vitl-normal":  _moge("moge-2-vitl-normal",
                                  "Ruicheng/moge-2-vitl-normal",
-                                 "MoGe-2 ViT-L + normal"),
+                                 "MoGe-2 ViT-L + normal",
+                                 has_normals=True),
 }
 
 DEFAULT_MODEL = "dav2-indoor-small"

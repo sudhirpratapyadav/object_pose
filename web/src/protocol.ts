@@ -16,12 +16,14 @@ export const KIND_MODEL_STATE = 5;
 export const KIND_MASK = 6;
 export const KIND_SAM_STATE = 7;
 export const KIND_STATS = 8;
+export const KIND_NORMAL_JPEG = 9;
 
 export type ModelState = {
   model: string;
   status: string;
   progress: string;
   file: string;
+  has_normals?: boolean;
 };
 
 export type SamState = {
@@ -64,11 +66,13 @@ export type MeshFrame = {
   xyz: Float16Array;       // length 3nv
   rgb: Uint8Array;         // length 3nv
   faces: Uint32Array;      // length 3nf
+  normal: Float16Array | null;  // length 3nv, or null if model has no normals
   nv: number; nf: number;
 };
 
 export type JpegFrame = {
-  kind: typeof KIND_JPEG | typeof KIND_DEPTH_JPEG; seq: number;
+  kind: typeof KIND_JPEG | typeof KIND_DEPTH_JPEG | typeof KIND_NORMAL_JPEG;
+  seq: number;
   w: number; h: number; bytes: Uint8Array;
 };
 
@@ -107,7 +111,9 @@ const MAGIC = 0x46443350; // 'P3DF' little-endian
 export class Float16Array extends Float32Array {}
 
 function f16BytesToF32(buf: ArrayBuffer, byteOffset: number, n: number): Float32Array {
-  const u16 = new Uint16Array(buf, byteOffset, n);
+  // Copy first so we don't depend on byteOffset being 2-byte aligned.
+  const slice = buf.slice(byteOffset, byteOffset + n * 2);
+  const u16 = new Uint16Array(slice);
   const f32 = new Float32Array(n);
   for (let i = 0; i < n; i++) f32[i] = halfToFloat(u16[i]);
   return f32;
@@ -144,22 +150,30 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
     }
     case KIND_MESH: {
       const nv = dv.getUint32(off, true); off += 4;
-      const nf = dv.getUint32(off + 0, true); off += 4;
+      const nf = dv.getUint32(off, true); off += 4;
+      const hasN = dv.getUint8(off) !== 0; off += 1;
       const xyz = f16BytesToF32(buf, off, 3 * nv) as unknown as Float16Array;
       off += 6 * nv;
       const rgb = new Uint8Array(buf.slice(off, off + 3 * nv)); off += 3 * nv;
-      // Faces follow at u32 alignment. Bytes-position must be multiple of 4.
-      // 6*nv is always even but not always /4; rgb is 3*nv bytes; total may be odd.
       const faces = new Uint32Array(buf.slice(off, off + 12 * nf));
-      return { kind: KIND_MESH, seq, xyz, rgb, faces, nv, nf };
+      off += 12 * nf;
+      let normal: Float16Array | null = null;
+      if (hasN) {
+        normal = f16BytesToF32(buf, off, 3 * nv) as unknown as Float16Array;
+        off += 6 * nv;
+      }
+      return { kind: KIND_MESH, seq, xyz, rgb, faces, normal, nv, nf };
     }
     case KIND_JPEG:
-    case KIND_DEPTH_JPEG: {
+    case KIND_DEPTH_JPEG:
+    case KIND_NORMAL_JPEG: {
       const w = dv.getUint16(off, true); off += 2;
       const h = dv.getUint16(off, true); off += 2;
       const bytes = new Uint8Array(buf, off);
-      return { kind: kind as typeof KIND_JPEG | typeof KIND_DEPTH_JPEG,
-               seq, w, h, bytes };
+      return {
+        kind: kind as typeof KIND_JPEG | typeof KIND_DEPTH_JPEG | typeof KIND_NORMAL_JPEG,
+        seq, w, h, bytes,
+      };
     }
     case KIND_META: {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
