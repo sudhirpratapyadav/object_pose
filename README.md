@@ -8,22 +8,26 @@ Pipeline:
 RealSense (thread)
     └── shm "rgb" ──► depth process (any backend)
                           ├── shm "depth"
-                          └── shm "pc_xyz" + "pc_rgb"
-                                          └── viser viewer (main thread)
+                          ├── shm "pc_xyz" + "pc_rgb"
+                          └── shm "mesh_*"
+                                  └── web_server.py ──► WebSocket ──► browser (React + Three.js)
 ```
 
 ## Layout
 
-| Path                          | What it does                                              |
-| ----------------------------- | --------------------------------------------------------- |
-| `camera/realsense.py`         | Threaded RealSense color stream, returns intrinsics       |
-| `depth/runner.py`             | Worker process + shared-memory layout                     |
-| `depth/backends/base.py`      | `DepthBackend` interface (`load`, `infer`)                |
-| `depth/backends/hf_pipeline.py` | Wraps `transformers.pipeline("depth-estimation")`       |
-| `depth/backends/unidepth.py`  | UniDepth V2 (predicts intrinsics + metric depth)          |
-| `depth/backends/metric3d.py`  | Metric3D V2 (torch.hub)                                   |
-| `viewer/server.py`            | Viser GUI: RGB / depth panels, 3D point cloud, frustum    |
-| `detect.py`                   | Main entry point — wires camera → depth → viewer          |
+| Path                            | What it does                                              |
+| ------------------------------- | --------------------------------------------------------- |
+| `camera/realsense.py`           | Threaded RealSense color stream, returns intrinsics       |
+| `depth/runner.py`               | Worker process + shared-memory layout                     |
+| `depth/backends/base.py`        | `DepthBackend` interface (`load`, `infer`)                |
+| `depth/backends/hf_pipeline.py` | Wraps `transformers.pipeline("depth-estimation")`         |
+| `depth/backends/unidepth.py`    | UniDepth V2 (predicts intrinsics + metric depth)          |
+| `depth/backends/metric3d.py`    | Metric3D V2 (torch.hub)                                   |
+| `segment/`                      | SAM2 worker — click-driven masks + 3D bbox                |
+| `robot/`                        | MJCF loader, robot-state shm, server-side FK              |
+| `hardware/`                     | Kinova Gen3 OSC torque loop (Pinocchio dynamics)          |
+| `web_server.py`                 | WebSocket server bridging shm → browser                   |
+| `web/`                          | React + Three.js frontend                                 |
 
 ## Models
 
@@ -68,15 +72,54 @@ uv pip install --no-build-isolation \
 uv pip install timm
 ```
 
+## Calibration config
+
+`cam_calib_config.yaml` at the repo root is required (see
+`cam_calib_config.yaml.example` for a template). It is the **single source of
+truth** for both real and sim modes — extrinsics + intrinsics + resolution.
+The server hard-errors at startup if the file is missing.
+
+In real mode the server requests the camera at the YAML resolution, dumps the
+RealSense factory intrinsics to `cam_factory_intrinsics.yaml` (read-only
+snapshot for reference), and uses the YAML intrinsics for the depth pipeline.
+In sim mode the YAML values patch the named MJCF camera at runtime.
+
+The browser has live extrinsics sliders that publish updates back to the
+server; clicking *Save to YAML* persists them.
+
 ## Run
 
+Real mode (RealSense + camera):
+
 ```bash
-uv run detect.py
+uv run web_server.py
 ```
 
-Open <http://localhost:8080>. The GUI shows live RGB, model depth, a 3D point
-cloud, the camera frustum + origin frame, FPS counters, and a depth-model
-dropdown with download progress.
+Real mode + robot display (animated dummy joints):
+
+```bash
+uv run web_server.py --mjcf robot/mjcf/scene.xml --robot-source dummy
+```
+
+Sim mode (MuJoCo provides the camera + physics; robot is interactive):
+
+```bash
+uv run web_server.py --mode sim --mjcf robot/mjcf/scene.xml
+# add --mujoco-gui to also open the native passive viewer window
+```
+
+Then open <http://localhost:5173> (Vite dev) — or run `npm run build` inside
+`web/` to ship the static bundle.
+
+Flags:
+
+- `--mode {real,sim}` — `sim` swaps RealSense for a MuJoCo render of `--mjcf`.
+- `--mjcf PATH` — load an MJCF for robot display (required in `sim` mode).
+- `--robot-source {none,dummy,sim}` — `dummy` animates joints; `sim` is
+  implied by `--mode sim`.
+- `--sim-camera NAME` — which MJCF camera to render in sim mode
+  (default `ext_rgbd`).
+- `--mujoco-gui` — open MuJoCo's passive native viewer (sim mode only).
 
 ## Hardware
 

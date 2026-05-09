@@ -17,6 +17,19 @@ export const KIND_MASK = 6;
 export const KIND_SAM_STATE = 7;
 export const KIND_STATS = 8;
 export const KIND_NORMAL_JPEG = 9;
+export const KIND_ROBOT_GEOMETRY = 10;
+export const KIND_ROBOT_TRANSFORMS = 11;
+export const KIND_CAM_CALIB = 12;
+
+// MuJoCo geom type codes (mjtGeom).
+export const GEOM_PLANE     = 0;
+export const GEOM_HFIELD    = 1;
+export const GEOM_SPHERE    = 2;
+export const GEOM_CAPSULE   = 3;
+export const GEOM_ELLIPSOID = 4;
+export const GEOM_CYLINDER  = 5;
+export const GEOM_BOX       = 6;
+export const GEOM_MESH      = 7;
 
 export type ModelState = {
   model: string;
@@ -38,6 +51,19 @@ export type Stats = {
   sam_ms: number;
 };
 
+export type CamCalibPayload = {
+  extrinsics: {
+    pos: [number, number, number];
+    euler_deg: [number, number, number];
+    pos_world: [number, number, number];
+    quat_wxyz: [number, number, number, number];
+  };
+  intrinsics: {
+    fx: number; fy: number; cx: number; cy: number;
+    width: number; height: number;
+  };
+};
+
 export type Meta = {
   rgb_w: number; rgb_h: number;
   infer_w: number; infer_h: number;
@@ -47,12 +73,54 @@ export type Meta = {
   viz_hz: number;
   models: string[];
   default_model: string;
+  camera_depth_available?: boolean;
+  camera_depth_label?: string;
   model_state?: ModelState;
   sam_models: string[];
   sam_default_model: string;
   sam_state?: SamState;
   videos: string[];
   source: { kind: "live" | "video"; video: string | null };
+  robot?: {
+    enabled: boolean; source: string; mjcf: string | null;
+    actuators: { name: string; min: number; max: number; home: number }[];
+  };
+  cam_calib?: CamCalibPayload;
+};
+
+export type RobotBody = { name: string; parent: number };
+export type RobotMeshIndex = {
+  vert_offset: number; vert_count: number;
+  face_offset: number; face_count: number;
+};
+export type RobotGeom = {
+  body: number;
+  type: number;             // GEOM_*
+  pos: [number, number, number];
+  quat: [number, number, number, number];   // wxyz
+  size: [number, number, number];
+  color: [number, number, number, number];
+  mesh: number | null;       // index into RobotGeometryFrame.meshes
+};
+
+export type RobotGeometryFrame = {
+  kind: typeof KIND_ROBOT_GEOMETRY; seq: number;
+  bodies: RobotBody[];
+  meshes: RobotMeshIndex[];
+  geoms: RobotGeom[];
+  blob: ArrayBuffer;          // concatenated verts_f32 + faces_u32 per mesh
+};
+
+export type RobotTransformsFrame = {
+  kind: typeof KIND_ROBOT_TRANSFORMS; seq: number;
+  xpos: Float32Array;         // length 3*nbody
+  xquat: Float32Array;        // length 4*nbody, wxyz
+  nbody: number;
+};
+
+export type CamCalibFrame = {
+  kind: typeof KIND_CAM_CALIB; seq: number;
+  calib: CamCalibPayload;
 };
 
 export type PointsFrame = {
@@ -104,7 +172,8 @@ export type StatsFrame = {
 
 export type Frame =
   | PointsFrame | MeshFrame | JpegFrame | MetaFrame
-  | ModelStateFrame | SamStateFrame | MaskFrame | StatsFrame;
+  | ModelStateFrame | SamStateFrame | MaskFrame | StatsFrame
+  | RobotGeometryFrame | RobotTransformsFrame | CamCalibFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -205,6 +274,35 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
       const stats = JSON.parse(text) as Stats;
       return { kind: KIND_STATS, seq, stats };
+    }
+    case KIND_ROBOT_GEOMETRY: {
+      const jsonLen = dv.getUint32(off, true); off += 4;
+      const jsonBytes = new Uint8Array(buf, off, jsonLen); off += jsonLen;
+      const text = new TextDecoder().decode(jsonBytes);
+      const j = JSON.parse(text) as {
+        bodies: RobotBody[]; meshes: RobotMeshIndex[]; geoms: RobotGeom[];
+      };
+      // The mesh blob is the rest of the buffer. Slice into a standalone
+      // ArrayBuffer so callers don't have to track byteOffset.
+      const blob = buf.slice(off);
+      return {
+        kind: KIND_ROBOT_GEOMETRY, seq,
+        bodies: j.bodies, meshes: j.meshes, geoms: j.geoms,
+        blob,
+      };
+    }
+    case KIND_ROBOT_TRANSFORMS: {
+      const nbody = dv.getUint32(off, true); off += 4;
+      const xpos = new Float32Array(buf.slice(off, off + 12 * nbody));
+      off += 12 * nbody;
+      const xquat = new Float32Array(buf.slice(off, off + 16 * nbody));
+      off += 16 * nbody;
+      return { kind: KIND_ROBOT_TRANSFORMS, seq, xpos, xquat, nbody };
+    }
+    case KIND_CAM_CALIB: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const calib = JSON.parse(text) as CamCalibPayload;
+      return { kind: KIND_CAM_CALIB, seq, calib };
     }
   }
   return null;

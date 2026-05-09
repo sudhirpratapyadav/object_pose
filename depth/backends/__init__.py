@@ -6,10 +6,13 @@ from pathlib import Path
 from typing import Callable
 
 from .base import BackendInfo, DepthBackend
+from .camera import CameraDepthBackend, make_camera_backend
 from .hf_pipeline import HFPipelineBackend
 from .metric3d import Metric3DBackend
 from .moge import MoGeBackend
 from .unidepth import UniDepthBackend
+
+CAMERA_DEPTH_KEY = "camera-depth"
 
 WEIGHTS_ROOT = Path(__file__).parent.parent.parent / "weights"
 
@@ -52,8 +55,18 @@ def _moge(key: str, repo: str, label: str,
     return lambda focal_px: MoGeBackend(info, WEIGHTS_ROOT)
 
 
+# Sentinel factory: the camera-depth backend is built by depth_worker via
+# make_camera_backend(...) using runtime shm info, not via BACKENDS[key].
+def _camera_sentinel(focal_px: float) -> DepthBackend:
+    raise RuntimeError(
+        "camera-depth backend must be built via make_camera_backend(); the "
+        "depth worker handles this internally when model_key == 'camera-depth'."
+    )
+
+
 # Registry: key -> factory(focal_px) -> DepthBackend
 BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
+    CAMERA_DEPTH_KEY:      _camera_sentinel,
     "dav2-indoor-small":   _hf("dav2-indoor-small",   "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"),
     "dav2-indoor-base":    _hf("dav2-indoor-base",    "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"),
     "dav2-indoor-large":   _hf("dav2-indoor-large",   "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"),
@@ -93,5 +106,6 @@ def make_backend(key: str, focal_px: float) -> DepthBackend:
     return BACKENDS[key](focal_px)
 
 
-__all__ = ["BACKENDS", "DEFAULT_MODEL", "make_backend",
-           "BackendInfo", "DepthBackend"]
+__all__ = ["BACKENDS", "CAMERA_DEPTH_KEY", "DEFAULT_MODEL",
+           "make_backend", "make_camera_backend",
+           "BackendInfo", "DepthBackend", "CameraDepthBackend"]

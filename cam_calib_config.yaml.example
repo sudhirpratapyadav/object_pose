@@ -1,0 +1,33 @@
+# Camera calibration — single source of truth for both real and sim modes.
+#
+# Copy this to cam_calib_config.yaml and edit. The file is required at server
+# startup; the server hard-errors if it is missing.
+#
+# extrinsics: T_world_camera
+#   pos:        camera position in world (metres)
+#   euler_deg:  XYZ Euler angles in degrees (right-multiplied: R = Rx @ Ry @ Rz applied to camera basis)
+#
+# intrinsics: pinhole model in pixels
+#   fx, fy: focal length
+#   cx, cy: principal point. MuJoCo cameras assume cx == width/2, cy == height/2;
+#           sim mode warns if your real-camera calibration places the principal
+#           point off-centre and falls back to centred for rendering.
+#   width, height: image resolution. Real mode requests this resolution from
+#                  the RealSense; sim mode patches the MJCF camera to render
+#                  at this resolution.
+#
+# When you re-calibrate the real camera, edit this file (or use the in-browser
+# calibration UI to save it). Sim mode picks up the changes the next time you
+# start in --mode sim.
+
+extrinsics:
+  pos: [-0.7338, 0.3575, 0.4501]
+  euler_deg: [-96.7683, -2.1089, -133.0391]
+
+intrinsics:
+  fx: 486.662
+  fy: 487.415
+  cx: 320.0
+  cy: 240.0
+  width: 640
+  height: 480

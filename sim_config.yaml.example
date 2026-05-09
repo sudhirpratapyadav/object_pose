@@ -1,0 +1,29 @@
+# Sim ground truth.
+#
+# This file declares where MuJoCo actually places the rendered camera and
+# what optics it uses. It is consumed only in --mode sim, and only by the
+# sim worker that patches the MJCF camera at runtime. The depth pipeline
+# does NOT read this file — it reads cam_calib_config.yaml (the user's
+# belief).
+#
+# Keep this DIFFERENT from cam_calib_config.yaml. When they match, the
+# point cloud lands exactly on the simulated objects. When they differ,
+# the point cloud sits offset — which is precisely what calibration is
+# supposed to detect and fix. Letting them be the same here would defeat
+# the purpose of running calibration in sim.
+#
+# Required when --mode sim. Hard error at startup if missing.
+#
+# Same shape as cam_calib_config.yaml.
+
+extrinsics:
+  pos: [1.2, 0.0, 1.0]
+  euler_deg: [180.0, 0.0, 90.0]
+
+intrinsics:
+  fx: 600.0
+  fy: 600.0
+  cx: 320.0
+  cy: 240.0
+  width: 640
+  height: 480

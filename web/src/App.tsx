@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { CamCalibPanel } from "./CamCalibPanel";
+import { JointTargetsPanel } from "./JointTargetsPanel";
 import { Viewer } from "./Viewer";
 import { StreamState, useStream } from "./useStream";
 import { Card } from "./ui/Card";
@@ -12,6 +14,7 @@ export default function App() {
   const [display, setDisplay] = useState<"points" | "mesh" | "both">("points");
   const [showCamera, setShowCamera] = useState(false);
   const [showBBox, setShowBBox] = useState(false);
+  const [showRobot, setShowRobot] = useState(true);
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [depthUrl, setDepthUrl] = useState<string | null>(null);
   const [normalUrl, setNormalUrl] = useState<string | null>(null);
@@ -79,6 +82,7 @@ export default function App() {
           display={display}
           showCamera={showCamera}
           showBBox={showBBox}
+          showRobot={showRobot}
         />
       </div>
 
@@ -138,7 +142,18 @@ export default function App() {
             disabled={!models.length}
             onChange={(e) => stream.setModel(e.target.value)}
           >
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            {models.map((m) => {
+              const isCamera = m === "camera-depth";
+              const label = isCamera
+                ? (stream.meta?.camera_depth_label ?? "Camera depth")
+                : m;
+              const disabled = isCamera && !stream.meta?.camera_depth_available;
+              return (
+                <option key={m} value={m} disabled={disabled}>
+                  {label}{disabled ? " (unavailable)" : ""}
+                </option>
+              );
+            })}
           </select>
           <div className="help">{stream.modelState ? renderStatus(stream.modelState) : "—"}</div>
         </div>
@@ -194,6 +209,26 @@ export default function App() {
             Show 3D bounding box
           </label>
         </div>
+
+        {stream.meta?.robot?.enabled && (
+          <div className="row">
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showRobot}
+                onChange={(e) => setShowRobot(e.target.checked)}
+              />
+              Show robot
+            </label>
+            <span style={{ opacity: 0.6, fontSize: "0.85em", marginLeft: 8 }}>
+              {stream.meta.robot.source}
+            </span>
+          </div>
+        )}
+
+        <CamCalibPanel stream={stream} />
+
+        <JointTargetsPanel stream={stream} />
 
         <div className="row">
           <div className="label">SAM2 model</div>

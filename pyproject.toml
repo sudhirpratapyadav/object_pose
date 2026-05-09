@@ -12,7 +12,7 @@ dependencies = [
     "numpy>=1.26",
     "pillow>=10.0",
     "pyrealsense2>=2.55",
-    "viser>=0.2",
+    "mujoco>=3.2",
     "torch>=2.1",
     "torchvision>=0.16",
     "transformers>=4.40",
@@ -20,6 +20,7 @@ dependencies = [
     "tqdm>=4.65",
     "opencv-python>=4.8",
     "websockets>=12",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -42,4 +43,4 @@ build-backend = "hatchling.build"
 mmcv = ["setuptools", "wheel"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["camera", "depth", "viewer"]
+packages = ["camera", "depth", "segment", "robot", "hardware", "wire", "sim"]

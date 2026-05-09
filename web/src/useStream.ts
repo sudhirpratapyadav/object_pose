@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Frame, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH, KIND_META,
-  KIND_MODEL_STATE, KIND_NORMAL_JPEG, KIND_POINTS, KIND_SAM_STATE, KIND_STATS,
-  Meta, ModelState, SamState, Stats, parseFrame,
+  CamCalibPayload,
+  Frame, KIND_CAM_CALIB, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH,
+  KIND_META, KIND_MODEL_STATE, KIND_NORMAL_JPEG, KIND_POINTS,
+  KIND_ROBOT_GEOMETRY, KIND_ROBOT_TRANSFORMS,
+  KIND_SAM_STATE, KIND_STATS,
+  Meta, ModelState, RobotBody, RobotGeom, RobotMeshIndex,
+  SamState, Stats, parseFrame,
 } from "./protocol";
 
 type JpegRef = React.MutableRefObject<{ blobUrl: string | null; seq: number }>;
@@ -15,23 +19,47 @@ export type MaskData = {
   seq: number;
 };
 
+export type RobotGeometryData = {
+  bodies: RobotBody[];
+  meshes: RobotMeshIndex[];
+  geoms: RobotGeom[];
+  blob: ArrayBuffer;
+  seq: number;          // increments on each new geometry payload
+};
+
+export type RobotTransformsData = {
+  xpos: Float32Array;   // 3*nbody
+  xquat: Float32Array;  // 4*nbody, wxyz
+  nbody: number;
+  seq: number;
+};
+
 export type StreamState = {
   meta: Meta | null;
   modelState: ModelState | null;
   samState: SamState | null;
   stats: Stats | null;
+  camCalib: CamCalibPayload | null;
   pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
   meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; normal: Float32Array | null; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
   depthJpegRef: JpegRef;
   normalJpegRef: JpegRef;
   maskRef: React.MutableRefObject<MaskData | null>;
+  robotGeomRef: React.MutableRefObject<RobotGeometryData | null>;
+  robotXformRef: React.MutableRefObject<RobotTransformsData | null>;
+  // Live calibration ref for the Viewer (avoids re-renders on every drag).
+  camCalibRef: React.MutableRefObject<CamCalibPayload | null>;
   connected: boolean;
   setModel: (key: string) => void;
   setSamModel: (key: string) => void;
   samClick: (x: number, y: number) => void;
   samClear: () => void;
   setSource: (kind: "live" | "video", video?: string | null) => void;
+  setCamExtrinsics: (pos: [number, number, number],
+                     euler_deg: [number, number, number]) => void;
+  saveCamExtrinsics: () => void;
+  setTargetCtrl: (vals: number[]) => void;
 };
 
 export function useStream(url: string): StreamState {
@@ -39,8 +67,10 @@ export function useStream(url: string): StreamState {
   const [modelState, setModelState] = useState<ModelState | null>(null);
   const [samState, setSamState] = useState<SamState | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [camCalib, setCamCalib] = useState<CamCalibPayload | null>(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const camCalibRef = useRef<CamCalibPayload | null>(null);
 
   const pointsRef = useRef<StreamState["pointsRef"]["current"]>(null);
   const meshRef = useRef<StreamState["meshRef"]["current"]>(null);
@@ -48,6 +78,8 @@ export function useStream(url: string): StreamState {
   const depthJpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
   const normalJpegRef = useRef<{ blobUrl: string | null; seq: number }>({ blobUrl: null, seq: -1 });
   const maskRef = useRef<MaskData | null>(null);
+  const robotGeomRef = useRef<RobotGeometryData | null>(null);
+  const robotXformRef = useRef<RobotTransformsData | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,6 +115,14 @@ export function useStream(url: string): StreamState {
             setMeta(frame.meta);
             if (frame.meta.model_state) setModelState(frame.meta.model_state);
             if (frame.meta.sam_state) setSamState(frame.meta.sam_state);
+            if (frame.meta.cam_calib) {
+              setCamCalib(frame.meta.cam_calib);
+              camCalibRef.current = frame.meta.cam_calib;
+            }
+            break;
+          case KIND_CAM_CALIB:
+            setCamCalib(frame.calib);
+            camCalibRef.current = frame.calib;
             break;
           case KIND_MODEL_STATE:
             setModelState(frame.state);
@@ -131,6 +171,25 @@ export function useStream(url: string): StreamState {
           case KIND_NORMAL_JPEG:
             setBlob(normalJpegRef, frame.bytes, frame.seq);
             break;
+          case KIND_ROBOT_GEOMETRY: {
+            const prev = robotGeomRef.current?.seq ?? 0;
+            robotGeomRef.current = {
+              bodies: frame.bodies,
+              meshes: frame.meshes,
+              geoms:  frame.geoms,
+              blob:   frame.blob,
+              seq:    prev + 1,
+            };
+            break;
+          }
+          case KIND_ROBOT_TRANSFORMS:
+            robotXformRef.current = {
+              xpos:  frame.xpos,
+              xquat: frame.xquat,
+              nbody: frame.nbody,
+              seq:   frame.seq,
+            };
+            break;
         }
       };
     };
@@ -154,10 +213,25 @@ export function useStream(url: string): StreamState {
       send({ set_source: { kind, video } }),
     [],
   );
+  const setCamExtrinsics = useCallback(
+    (pos: [number, number, number], euler_deg: [number, number, number]) =>
+      send({ set_cam_extrinsics: { pos, euler_deg } }),
+    [],
+  );
+  const saveCamExtrinsics = useCallback(
+    () => send({ save_cam_extrinsics: true }),
+    [],
+  );
+  const setTargetCtrl = useCallback(
+    (vals: number[]) => send({ set_target_ctrl: vals }),
+    [],
+  );
 
   return {
-    meta, modelState, samState, stats,
+    meta, modelState, samState, stats, camCalib,
     pointsRef, meshRef, jpegRef, depthJpegRef, normalJpegRef, maskRef,
+    robotGeomRef, robotXformRef, camCalibRef,
     connected, setModel, setSamModel, samClick, samClear, setSource,
+    setCamExtrinsics, saveCamExtrinsics, setTargetCtrl,
   };
 }

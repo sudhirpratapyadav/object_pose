@@ -20,3 +20,9 @@ datasets/
 
 # OS
 .DS_Store
+
+# Active calibration configs — these hold per-machine values. Commit only
+# the .example templates so users see the shape but bring their own.
+cam_calib_config.yaml
+sim_config.yaml
+cam_factory_intrinsics.yaml

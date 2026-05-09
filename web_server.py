@@ -1,15 +1,8 @@
-"""Web-server entrypoint: camera + depth worker + WebSocket streamer.
+"""Web-server entrypoint: camera + depth worker + (optional) robot + WS streamer.
 
-Same pipeline as detect.py, but the viewer is a custom React+Three frontend in
-web/. This script streams binary frames (points / mesh / rgb-jpeg) to all
-connected browser clients.
-
-Wire format (little-endian, uint8 'kind' tag):
-  HEADER       : magic 'P3DF' u32, seq u32, kind u8, _pad u24
-  kind=0 pts   : n u32, xyz_f16 [3n], rgb_u8 [3n]
-  kind=1 mesh  : nv u32, nf u32, xyz_f16 [3nv], rgb_u8 [3nv], faces_u32 [3nf]
-  kind=2 jpeg  : w u16, h u16, jpeg_bytes...
-  kind=3 meta  : json_bytes... (intrinsics, fps, etc.)
+Streams binary frames (points / mesh / rgb-jpeg / robot transforms / ...) to all
+connected browser clients. Wire format is documented in wire/__init__.py and
+mirrored on the JS side in web/src/protocol.ts.
 """
 
 from __future__ import annotations
@@ -18,7 +11,6 @@ import argparse
 import asyncio
 import json
 import multiprocessing as mp
-import struct
 import time
 from typing import Set
 
@@ -29,6 +21,14 @@ import websockets
 from pathlib import Path
 
 from camera import NetworkRGB, RealSenseRGB, VideoFile
+from camera.realsense import Intrinsics as RsIntrinsics
+from config import (
+    CamCalib, CamCalibError, Extrinsics, Intrinsics as CfgIntrinsics,
+    CAM_CALIB_PATH, SIM_CONFIG_PATH,
+    load_cam_calib, load_sim_config,
+    matrix_to_quat_wxyz, save_cam_calib,
+    write_factory_intrinsics, FACTORY_INTR_PATH,
+)
 from depth import BACKENDS, create_shm, depth_worker, DEFAULT_MODEL
 from segment import (
     BACKENDS as SAM_BACKENDS,
@@ -36,9 +36,31 @@ from segment import (
     create_seg_shm,
     segment_worker,
 )
+from robot import (
+    DummySource,
+    FKEngine,
+    create_robot_shm,
+    load_robot_scene,
+)
+from robot.wire import build_robot_geometry_payload
+from wire import (
+    KIND_DEPTH_JPEG,
+    KIND_NORMAL_JPEG,
+    encode_cam_calib,
+    encode_jpeg,
+    encode_mask,
+    encode_mesh,
+    encode_meta,
+    encode_model_state,
+    encode_points,
+    encode_robot_geometry,
+    encode_robot_transforms,
+    encode_sam_state,
+    encode_stats,
+)
 
 VIZ_HZ = 30
-CAM_W, CAM_H, CAM_FPS = 1280, 720, 30
+CAM_FPS = 30
 INFER_W, INFER_H = 640, 480
 
 VIDEO_DIR = Path(__file__).parent / "datasets"
@@ -62,98 +84,27 @@ def list_videos() -> list[str]:
         out.append(str(p.relative_to(VIDEO_DIR)))
     return sorted(out)
 
-MAGIC = b"P3DF"
-KIND_POINTS      = 0
-KIND_MESH        = 1
-KIND_JPEG        = 2  # rgb camera image
-KIND_META        = 3  # one-shot connect payload (intrinsics + model keys)
-KIND_DEPTH_JPEG  = 4  # turbo-colormapped depth image
-KIND_MODEL_STATE = 5  # current depth model + status text + progress
-KIND_MASK        = 6  # SAM2 mask (per-point) + AABB
-KIND_SAM_STATE   = 7  # current SAM2 model + status
-KIND_STATS       = 8  # 1 Hz live stats: rgb fps, depth fps, sam_ms
-KIND_NORMAL_JPEG = 9  # colorized surface-normal image
+def _xform_points(xyz: np.ndarray, T: np.ndarray, mask_zero: bool = False) -> np.ndarray:
+    """Apply a 4x4 homogeneous transform to (N, 3) points.
 
-
-def _pack_header(seq: int, kind: int) -> bytes:
-    return MAGIC + struct.pack("<IB3x", seq & 0xFFFFFFFF, kind)
-
-
-def _f32_to_f16_bytes(arr_f32: np.ndarray) -> bytes:
-    return arr_f32.astype(np.float16).tobytes()
-
-
-def _frame_points(seq: int, xyz: np.ndarray, rgb: np.ndarray,
-                  mask: np.ndarray | None = None) -> bytes:
-    """Layout: header | n u32 | xyz_f16 [3n] | rgb_u8 [3n] | mask_u8 [n].
-
-    mask is per-point (same length as n). 0 if not segmented.
+    If ``mask_zero`` is set, points that were exactly (0,0,0) on input
+    (e.g. mesh vertices flagged invalid by fill_mesh) are forced back to
+    (0,0,0) afterwards so the GPU's degenerate-triangle cull still works.
     """
-    n = xyz.shape[0]
-    if mask is None:
-        mask = np.zeros((n,), dtype=np.uint8)
-    return (
-        _pack_header(seq, KIND_POINTS)
-        + struct.pack("<I", n)
-        + _f32_to_f16_bytes(xyz)
-        + rgb.astype(np.uint8).tobytes()
-        + mask.astype(np.uint8).tobytes()
-    )
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out = xyz @ R.T + t
+    if mask_zero:
+        invalid = np.all(xyz == 0.0, axis=-1)
+        if invalid.any():
+            out[invalid] = 0.0
+    return out.astype(np.float32, copy=False)
 
 
-def _frame_mesh(seq: int, xyz: np.ndarray, rgb: np.ndarray,
-                faces: np.ndarray, normal: np.ndarray | None = None) -> bytes:
-    """Layout: header | nv u32 | nf u32 | has_normal u8 | xyz_f16 [3nv]
-       | rgb_u8 [3nv] | faces_u32 [3nf] | normal_f16 [3nv if has_normal]."""
-    has_n = 1 if normal is not None else 0
-    body = (
-        struct.pack("<IIB", xyz.shape[0], faces.shape[0], has_n)
-        + _f32_to_f16_bytes(xyz)
-        + (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8).tobytes()
-        + faces.astype(np.uint32).tobytes()
-    )
-    if has_n:
-        body += _f32_to_f16_bytes(normal.astype(np.float32))
-    return _pack_header(seq, KIND_MESH) + body
-
-
-def _frame_jpeg(seq: int, bgr: np.ndarray, kind: int = KIND_JPEG,
-                quality: int = 70) -> bytes:
-    h, w = bgr.shape[:2]
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    if not ok:
-        return b""
-    return _pack_header(seq, kind) + struct.pack("<HH", w, h) + buf.tobytes()
-
-
-def _frame_meta(seq: int, payload: dict) -> bytes:
-    return _pack_header(seq, KIND_META) + json.dumps(payload).encode("utf-8")
-
-
-def _frame_model_state(seq: int, payload: dict) -> bytes:
-    return _pack_header(seq, KIND_MODEL_STATE) + json.dumps(payload).encode("utf-8")
-
-
-def _frame_sam_state(seq: int, payload: dict) -> bytes:
-    return _pack_header(seq, KIND_SAM_STATE) + json.dumps(payload).encode("utf-8")
-
-
-def _frame_stats(seq: int, payload: dict) -> bytes:
-    return _pack_header(seq, KIND_STATS) + json.dumps(payload).encode("utf-8")
-
-
-def _frame_mask(seq: int, mask_seq: int, mask: np.ndarray,
-                has_box: bool, box_min: np.ndarray, box_max: np.ndarray) -> bytes:
-    """mask: uint8 array, length grid_w*grid_h."""
-    n = int(mask.size)
-    body = (
-        struct.pack("<II", mask_seq & 0xFFFFFFFF, n)
-        + mask.astype(np.uint8).tobytes()
-        + struct.pack("<B", 1 if has_box else 0)
-        + box_min.astype(np.float32).tobytes()
-        + box_max.astype(np.float32).tobytes()
-    )
-    return _pack_header(seq, KIND_MASK) + body
+def _xform_normals(n: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Rotate (N, 3) unit normals (no translation)."""
+    R = T[:3, :3]
+    return (n @ R.T).astype(np.float32, copy=False)
 
 
 def _depth_to_turbo_bgr(depth_m: np.ndarray, dmax: float = 6.0) -> np.ndarray:
@@ -202,13 +153,16 @@ class Hub:
             await self.remove(ws)
 
 
-async def handler(ws, hub: Hub, get_meta_payload,
+async def handler(ws, hub: Hub, get_connect_frames,
                   on_set_model, on_set_sam_model,
                   on_sam_click, on_sam_clear,
-                  on_set_source) -> None:
+                  on_set_source,
+                  on_set_cam_extrinsics, on_save_cam_extrinsics,
+                  on_set_target_ctrl) -> None:
     await hub.add(ws)
     try:
-        await ws.send(_frame_meta(0, get_meta_payload()))
+        for frame in get_connect_frames():
+            await ws.send(frame)
         async for msg in ws:
             if isinstance(msg, str):
                 try:
@@ -231,23 +185,122 @@ async def handler(ws, hub: Hub, get_meta_payload,
                     kind = str(s.get("kind", "live"))
                     video = s.get("video")
                     await on_set_source(kind, str(video) if video else None)
+                elif "set_cam_extrinsics" in cmd and isinstance(cmd["set_cam_extrinsics"], dict):
+                    e = cmd["set_cam_extrinsics"]
+                    pos = e.get("pos") or [0.0, 0.0, 0.0]
+                    eul = e.get("euler_deg") or [0.0, 0.0, 0.0]
+                    if len(pos) == 3 and len(eul) == 3:
+                        await on_set_cam_extrinsics(
+                            [float(x) for x in pos],
+                            [float(x) for x in eul],
+                        )
+                elif "save_cam_extrinsics" in cmd:
+                    await on_save_cam_extrinsics()
+                elif "set_target_ctrl" in cmd and isinstance(cmd["set_target_ctrl"], list):
+                    vals = [float(x) for x in cmd["set_target_ctrl"]]
+                    await on_set_target_ctrl(vals)
     finally:
         await hub.remove(ws)
 
 
-def _make_camera(kind: str, video_name: str | None, args):
+def _make_camera(kind: str, video_name: str | None, args, cam_calib: CamCalib):
     """Build a camera-like object for the requested source. Caller calls .start()."""
+    if args.mode == "sim":
+        from sim import MujocoCamera
+        return MujocoCamera(cam_calib), False
     if kind == "video" and video_name:
         path = VIDEO_DIR / video_name
         if not path.exists():
             raise FileNotFoundError(f"video not found: {path}")
-        return VideoFile(str(path))
+        return VideoFile(str(path)), False
     if args.camera == "realsense":
-        return RealSenseRGB(width=CAM_W, height=CAM_H, fps=CAM_FPS)
-    return NetworkRGB(args.camera)
+        # Honour YAML resolution; intrinsics get overridden after start().
+        cam = RealSenseRGB(
+            width=cam_calib.intrinsics.width,
+            height=cam_calib.intrinsics.height,
+            fps=CAM_FPS,
+            enable_depth=True,
+        )
+        return cam, True
+    return NetworkRGB(args.camera), False
+
+
+def _calib_payload(calib: CamCalib) -> dict:
+    """Serialise the active CamCalib for the meta / cam-config wire frames."""
+    T = calib.T_world_camera()
+    quat_wxyz = matrix_to_quat_wxyz(T[:3, :3]).tolist()
+    return {
+        "extrinsics": {
+            "pos":       list(calib.extrinsics.pos),
+            "euler_deg": list(calib.extrinsics.euler_deg),
+            "pos_world": [float(T[0, 3]), float(T[1, 3]), float(T[2, 3])],
+            "quat_wxyz": [float(x) for x in quat_wxyz],
+        },
+        "intrinsics": {
+            "fx": calib.intrinsics.fx, "fy": calib.intrinsics.fy,
+            "cx": calib.intrinsics.cx, "cy": calib.intrinsics.cy,
+            "width":  calib.intrinsics.width,
+            "height": calib.intrinsics.height,
+        },
+    }
+
+
+def _intr_drift_warn(factory: RsIntrinsics, cfg: CfgIntrinsics) -> None:
+    """Log a warning if YAML intrinsics drift significantly from factory."""
+    issues: list[str] = []
+    if abs(factory.fx - cfg.fx) / max(factory.fx, 1.0) > 0.05:
+        issues.append(f"fx {factory.fx:.1f} -> {cfg.fx:.1f}")
+    if abs(factory.fy - cfg.fy) / max(factory.fy, 1.0) > 0.05:
+        issues.append(f"fy {factory.fy:.1f} -> {cfg.fy:.1f}")
+    if abs(factory.cx - cfg.cx) > 10.0:
+        issues.append(f"cx {factory.cx:.1f} -> {cfg.cx:.1f}")
+    if abs(factory.cy - cfg.cy) > 10.0:
+        issues.append(f"cy {factory.cy:.1f} -> {cfg.cy:.1f}")
+    if issues:
+        print(f"[cam] WARNING: YAML intrinsics differ from factory: "
+              f"{', '.join(issues)}", flush=True)
 
 
 async def main_async(args) -> None:
+    # Calibration config (the depth pipeline's belief): required in both modes.
+    try:
+        cam_calib = load_cam_calib()
+    except CamCalibError as exc:
+        print(f"[cfg] {exc}", flush=True)
+        return
+    print(f"[cfg] cam_calib  {cam_calib.intrinsics.width}x{cam_calib.intrinsics.height}  "
+          f"fx={cam_calib.intrinsics.fx:.1f} fy={cam_calib.intrinsics.fy:.1f}  "
+          f"pos={cam_calib.extrinsics.pos}  euler={cam_calib.extrinsics.euler_deg}",
+          flush=True)
+
+    # Sim ground truth: required in sim mode, ignored in real mode.
+    sim_calib: CamCalib | None = None
+    if args.mode == "sim":
+        try:
+            sim_calib = load_sim_config()
+        except CamCalibError as exc:
+            print(f"[cfg] {exc}", flush=True)
+            return
+        # Resolution must match between belief and ground truth: the depth
+        # pipeline back-projects pixels using cam_calib intrinsics, and those
+        # pixels are produced by the sim renderer at sim_calib resolution.
+        # Different fx/fy/cx/cy (and pos/euler) is the whole point — different
+        # WIDTH/HEIGHT is a configuration bug.
+        if (cam_calib.intrinsics.width  != sim_calib.intrinsics.width or
+            cam_calib.intrinsics.height != sim_calib.intrinsics.height):
+            print(
+                f"[cfg] resolution mismatch: cam_calib is "
+                f"{cam_calib.intrinsics.width}x{cam_calib.intrinsics.height}, "
+                f"sim_config is "
+                f"{sim_calib.intrinsics.width}x{sim_calib.intrinsics.height}. "
+                f"Both YAMLs must declare the same resolution.",
+                flush=True)
+            return
+        print(f"[cfg] sim_truth {sim_calib.intrinsics.width}x{sim_calib.intrinsics.height}  "
+              f"fx={sim_calib.intrinsics.fx:.1f} fy={sim_calib.intrinsics.fy:.1f}  "
+              f"pos={sim_calib.extrinsics.pos}  euler={sim_calib.extrinsics.euler_deg}",
+              flush=True)
+
     # ---- Mutable session: cam + shm + seg, rebuildable on source switch ----
     sess: dict = {
         "kind": "live",
@@ -257,14 +310,49 @@ async def main_async(args) -> None:
         "shm": None,
         "seg": None,
         "fx_i": 0.0, "fy_i": 0.0, "cx_i": 0.0, "cy_i": 0.0,
+        "calib": cam_calib,    # active CamCalib; mutated by calibration commands
     }
 
     def build_session(kind: str, video_name: str | None) -> None:
-        cam = _make_camera(kind, video_name, args)
+        cam, is_realsense = _make_camera(kind, video_name, args, cam_calib)
         intr = cam.start()
+        if is_realsense and kind == "live":
+            # Snapshot what the SDK reported, then override with YAML.
+            ci = cam_calib.intrinsics
+            factory_intr = CfgIntrinsics(
+                fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy,
+                width=intr.width, height=intr.height,
+            )
+            try:
+                write_factory_intrinsics(
+                    factory_intr,
+                    header=f"RealSense factory snapshot from "
+                           f"{cam_calib.intrinsics.width}x{cam_calib.intrinsics.height} stream "
+                           f"(generated; not read by the server)",
+                )
+                print(f"[cam] factory intrinsics dumped to {FACTORY_INTR_PATH.name}",
+                      flush=True)
+            except OSError as exc:
+                print(f"[cam] could not write {FACTORY_INTR_PATH}: {exc}", flush=True)
+            _intr_drift_warn(intr, ci)
+            # Override with YAML for the rest of the pipeline.
+            intr = RsIntrinsics(width=ci.width, height=ci.height,
+                                fx=ci.fx, fy=ci.fy, cx=ci.cx, cy=ci.cy)
+            print(f"[cam] using YAML intrinsics: fx={ci.fx:.1f} fy={ci.fy:.1f} "
+                  f"cx={ci.cx:.1f} cy={ci.cy:.1f}", flush=True)
+
         sx = INFER_W / intr.width
         sy = INFER_H / intr.height
-        shm = create_shm(intr.width, intr.height, INFER_W, INFER_H)
+        # Allocate the camera-depth side channel only when the source can
+        # actually fill it (RealSense with depth, or sim mode).
+        if args.mode == "sim":
+            with_depth_stream = True
+        elif is_realsense:
+            with_depth_stream = bool(getattr(cam, "has_depth", False))
+        else:
+            with_depth_stream = False
+        shm = create_shm(intr.width, intr.height, INFER_W, INFER_H,
+                         with_depth_stream=with_depth_stream)
         seg = create_seg_shm(shm.mesh_grid_w, shm.mesh_grid_h)
         sess.update(
             kind=kind, video=video_name,
@@ -298,10 +386,28 @@ async def main_async(args) -> None:
             "viz_hz": VIZ_HZ,
             "models": list(BACKENDS.keys()),
             "default_model": DEFAULT_MODEL,
+            "camera_depth_available": shm.depth_stream is not None,
+            "camera_depth_label": (
+                "Camera depth (MuJoCo)" if args.mode == "sim"
+                else "Camera depth (RealSense)"
+            ),
             "sam_models": list(SAM_BACKENDS.keys()),
             "sam_default_model": SAM_DEFAULT_MODEL,
             "videos": list_videos(),
             "source": {"kind": sess["kind"], "video": sess["video"]},
+            "robot": {
+                "enabled": robot["enabled"],
+                "source":  robot["source_kind"],
+                "mjcf":    str(args.mjcf) if args.mjcf else None,
+                "actuators": (
+                    [
+                        {"name": a.name, "min": a.ctrl_min,
+                         "max": a.ctrl_max, "home": a.home_ctrl}
+                        for a in robot["scene"].actuators
+                    ] if robot["enabled"] and robot["scene"] is not None else []
+                ),
+            },
+            "cam_calib": _calib_payload(sess["calib"]),
         }
 
     hub = Hub()
@@ -323,10 +429,60 @@ async def main_async(args) -> None:
         "file": "",
     }
 
+    # ---- Robot (optional) ------------------------------------------------
+    robot: dict = {
+        "enabled":      bool(args.mjcf),
+        "source_kind":  args.robot_source,
+        "scene":        None,    # robot.RobotScene
+        "fk":           None,    # robot.FKEngine
+        "shm":          None,    # robot.RobotShm
+        "src":          None,    # robot.DummySource (or future producers)
+        "geom_payload": b"",     # cached KIND_ROBOT_GEOMETRY frame
+        "last_seq":     0,       # last qpos_seq we broadcast
+        "nu":           0,       # number of actuators (for ctrl shm)
+        "ctrl_arr":     None,    # mp.Array('d', nu)
+        "ctrl_seq":     None,    # mp.Value('I')
+    }
+    if robot["enabled"]:
+        scene = load_robot_scene(args.mjcf)
+        fk = FKEngine(scene.model)
+        home = scene.home_qpos()
+        rshm = create_robot_shm(scene.nq, init_qpos=home)
+        bodies, meshes, geoms_json, blob = build_robot_geometry_payload(scene)
+        robot.update(scene=scene, fk=fk, shm=rshm)
+        robot["geom_payload"] = encode_robot_geometry(0, bodies, meshes,
+                                                      geoms_json, blob)
+        # Control input slot (sim worker reads each step).
+        nu = int(scene.model.nu)
+        ctrl_arr = mp.Array("d", max(1, nu), lock=True)
+        ctrl_seq = mp.Value("I", 0, lock=False)
+        # Seed with home ctrl so initial state matches the home keyframe.
+        if nu > 0:
+            init_ctrl = np.array([a.home_ctrl for a in scene.actuators],
+                                 dtype=np.float64)
+            with ctrl_arr.get_lock():
+                np.frombuffer(ctrl_arr.get_obj(), dtype=np.float64)[:nu] = init_ctrl
+        robot.update(nu=nu, ctrl_arr=ctrl_arr, ctrl_seq=ctrl_seq)
+        n_mesh_bytes = len(blob)
+        print(f"[robot] loaded {args.mjcf}: {len(scene.bodies)} bodies, "
+              f"{len(scene.geoms)} visual geoms, "
+              f"{len(meshes)} unique meshes, "
+              f"{n_mesh_bytes/1024:.1f} KiB mesh data, nu={nu}", flush=True)
+        if args.robot_source == "dummy":
+            robot["src"] = DummySource(rshm, home)
+            robot["src"].start()
+            print("[robot] dummy qpos source started", flush=True)
+        # 'sim' source is spawned later, after rgb_shm exists.
+
     def spawn_depth(model_key: str) -> None:
         shm = sess["shm"]
         stop_ev  = mp.Event()
         status_q = mp.Queue(maxsize=64)
+        depth_stream_name = (shm.depth_stream.name
+                             if shm.depth_stream is not None else None)
+        # Mode-aware label so the dropdown reads naturally.
+        depth_label = ("Camera depth (MuJoCo)" if args.mode == "sim"
+                       else "Camera depth (RealSense)")
         proc = mp.Process(
             target=depth_worker,
             args=(
@@ -338,7 +494,8 @@ async def main_async(args) -> None:
                 shm.rgb_w, shm.rgb_h, shm.infer_w, shm.infer_h, shm.n_max,
                 shm.mesh_grid_w, shm.mesh_grid_h, shm.mesh_n_faces,
                 sess["fx_i"], sess["fy_i"], sess["cx_i"], sess["cy_i"],
-                stop_ev, status_q, model_key,
+                stop_ev, status_q, model_key, "cuda",
+                depth_stream_name, depth_label,
             ),
             daemon=True,
         )
@@ -426,20 +583,20 @@ async def main_async(args) -> None:
             return
         state.update(model_status=f"switching to {key} ...",
                      model_progress="", model_file="")
-        await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
+        await hub.broadcast(encode_model_state(0, make_model_state_payload()))
         # Run blocking spawn/stop in a thread so we don't stall the loop.
         await asyncio.to_thread(stop_depth)
         shm = sess["shm"]
         with shm.pc_count.get_lock():
             shm.pc_count.value = 0
         await asyncio.to_thread(spawn_depth, key)
-        await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
+        await hub.broadcast(encode_model_state(0, make_model_state_payload()))
 
     async def on_set_sam_model(key: str) -> None:
         if key == sam_state["model"] or key not in SAM_BACKENDS:
             return
         sam_state.update(status=f"switching to {key} ...", file="")
-        await hub.broadcast(_frame_sam_state(0, make_sam_state_payload()))
+        await hub.broadcast(encode_sam_state(0, make_sam_state_payload()))
         await asyncio.to_thread(stop_seg)
         # Wipe any current mask so the UI doesn't keep showing an old object.
         seg = sess["seg"]
@@ -447,7 +604,7 @@ async def main_async(args) -> None:
         with seg.has_mask.get_lock(): seg.has_mask.value = 0
         with seg.mask_seq.get_lock(): seg.mask_seq.value = seg.mask_seq.value + 1
         await asyncio.to_thread(spawn_seg, key)
-        await hub.broadcast(_frame_sam_state(0, make_sam_state_payload()))
+        await hub.broadcast(encode_sam_state(0, make_sam_state_payload()))
 
     sam_pending_t = {"t": 0.0}    # mutable closure cell for click-time
     sam_last_ms = {"v": 0}        # most recent click->mask latency (ms)
@@ -468,6 +625,37 @@ async def main_async(args) -> None:
         with seg.click_seq.get_lock(): seg.click_seq.value = seg.click_seq.value + 1
         sam_pending_t["t"] = 0.0
 
+    async def on_set_cam_extrinsics(pos: list[float], euler_deg: list[float]) -> None:
+        """Live calibration update from a slider drag. Cheap, in-memory only."""
+        sess["calib"] = CamCalib(
+            extrinsics=Extrinsics(pos=pos, euler_deg=euler_deg),
+            intrinsics=sess["calib"].intrinsics,
+        )
+        await hub.broadcast(encode_cam_calib(0, _calib_payload(sess["calib"])))
+
+    async def on_save_cam_extrinsics() -> None:
+        """Persist the current in-memory calibration to YAML."""
+        try:
+            await asyncio.to_thread(save_cam_calib, sess["calib"], CAM_CALIB_PATH)
+            print(f"[cfg] saved {CAM_CALIB_PATH.name}: "
+                  f"pos={sess['calib'].extrinsics.pos} "
+                  f"euler={sess['calib'].extrinsics.euler_deg}", flush=True)
+        except Exception as exc:
+            print(f"[cfg] save failed: {exc}", flush=True)
+
+    async def on_set_target_ctrl(vals: list[float]) -> None:
+        """Browser slider -> sim worker. No-op when no robot loaded."""
+        nu = robot["nu"]
+        if nu == 0 or robot["ctrl_arr"] is None:
+            return
+        if len(vals) != nu:
+            print(f"[ctrl] ignoring set_target_ctrl: got {len(vals)} values, "
+                  f"expected {nu}", flush=True)
+            return
+        with robot["ctrl_arr"].get_lock():
+            np.frombuffer(robot["ctrl_arr"].get_obj(), dtype=np.float64)[:nu] = vals
+            robot["ctrl_seq"].value = (robot["ctrl_seq"].value + 1) & 0xFFFFFFFF
+
     async def on_set_source(kind: str, video_name: str | None) -> None:
         # No-op if already on this source.
         if kind == sess["kind"] and video_name == sess["video"]:
@@ -483,7 +671,7 @@ async def main_async(args) -> None:
             # Fall back to live camera.
             build_session("live", None)
         # Push the new meta + reset workers.
-        await hub.broadcast(_frame_meta(0, {
+        await hub.broadcast(encode_meta(0, {
             **make_meta_payload(),
             "model_state": make_model_state_payload(),
             "sam_state": make_sam_state_payload(),
@@ -494,19 +682,74 @@ async def main_async(args) -> None:
     spawn_depth(args.model)
     spawn_seg(args.sam_model)
 
+    # ---- Sim worker (mode == sim) ----------------------------------------
+    sim: dict = {"proc": None, "stop_ev": None}
+
+    if args.mode == "sim":
+        from sim import sim_worker, mj_camera_params
+        # Sim worker uses sim_calib (ground truth) for camera placement +
+        # optics. The depth pipeline elsewhere uses sess["calib"] (belief).
+        cam_pos, cam_quat, cam_fovy = mj_camera_params(sim_calib)
+        sim_stop_ev = mp.Event()
+        sim_proc = mp.Process(
+            target=sim_worker,
+            args=(args.mjcf, args.sim_camera),
+            kwargs={
+                "rgb_shm_name": sess["shm"].rgb.name,
+                "rgb_seq":      sess["shm"].rgb_seq,
+                "rgb_w":        sim_calib.intrinsics.width,
+                "rgb_h":        sim_calib.intrinsics.height,
+                "qpos_arr":     robot["shm"].qpos,
+                "qpos_seq":     robot["shm"].qpos_seq,
+                "nq":           robot["shm"].nq,
+                "ctrl_arr":     robot["ctrl_arr"],
+                "ctrl_seq":     robot["ctrl_seq"],
+                "nu":           robot["nu"],
+                "cam_pos":      tuple(float(x) for x in cam_pos),
+                "cam_quat_wxyz": tuple(float(x) for x in cam_quat),
+                "cam_fovy_deg": float(cam_fovy),
+                # Camera-depth side channel: only allocated when depth_stream
+                # shm exists (build_session sets this up in sim mode).
+                "depth_shm_name": (sess["shm"].depth_stream.name
+                                   if sess["shm"].depth_stream is not None else None),
+                "rgbd_seq":     sess["shm"].rgbd_seq,
+                "stop_ev":      sim_stop_ev,
+                "open_viewer":  bool(args.mujoco_gui),
+            },
+            daemon=True,
+        )
+        sim_proc.start()
+        sim.update(proc=sim_proc, stop_ev=sim_stop_ev)
+        print(f"[sim] worker started (camera={args.sim_camera}, "
+              f"viewer={'on' if args.mujoco_gui else 'off'})", flush=True)
+
+    def stop_sim() -> None:
+        if sim["stop_ev"] is not None:
+            sim["stop_ev"].set()
+        if sim["proc"] is not None:
+            sim["proc"].join(timeout=5.0)
+            if sim["proc"].is_alive():
+                sim["proc"].terminate()
+
     async def ws_loop():
-        def get_meta():
-            return {
+        def get_connect_frames() -> list[bytes]:
+            meta = encode_meta(0, {
                 **make_meta_payload(),
                 "model_state": make_model_state_payload(),
                 "sam_state": make_sam_state_payload(),
-            }
+            })
+            frames = [meta]
+            if robot["enabled"] and robot["geom_payload"]:
+                frames.append(robot["geom_payload"])
+            return frames
         async with websockets.serve(
             lambda ws: handler(
-                ws, hub, get_meta,
+                ws, hub, get_connect_frames,
                 on_set_model, on_set_sam_model,
                 on_sam_click, on_sam_clear,
                 on_set_source,
+                on_set_cam_extrinsics, on_save_cam_extrinsics,
+                on_set_target_ctrl,
             ),
             args.host, args.port,
             max_size=None, compression=None, ping_interval=20,
@@ -519,6 +762,7 @@ async def main_async(args) -> None:
         seq = 0
         last_depth_seq = 0
         last_mask_seq = 0
+        last_rgb_seq = 0
         n_rgb = n_depth = 0
         t_log = time.time()
 
@@ -568,7 +812,7 @@ async def main_async(args) -> None:
                     elif kind == "error":
                         state.update(model_status="error", model_progress="",
                                      model_file=latest[1] if len(latest) > 1 else "")
-                    await hub.broadcast(_frame_model_state(0, make_model_state_payload()))
+                    await hub.broadcast(encode_model_state(0, make_model_state_payload()))
 
             # Drain SAM-worker status queue.
             ssq = sam_state["status_q"]
@@ -596,15 +840,38 @@ async def main_async(args) -> None:
                     elif kind == "error":
                         sam_state.update(status="error",
                                          file=latest[1] if len(latest) > 1 else "")
-                    await hub.broadcast(_frame_sam_state(0, make_sam_state_payload()))
+                    await hub.broadcast(encode_sam_state(0, make_sam_state_payload()))
 
+            # Real-mode: pull RGB from cam and write to shm + bump seq.
+            # Sim-mode: cam.get() returns None — the sim worker writes shm
+            # and bumps seq directly. Either way, the rgb_seq-advance branch
+            # below broadcasts the JPEG.
             rgb = cam.get()
             if rgb is not None:
                 rgb_buf[...] = rgb
                 with shm.rgb_seq.get_lock():
                     shm.rgb_seq.value += 1
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                await hub.broadcast(_frame_jpeg(seq, bgr))
+
+            # If the camera supports depth, copy the latest depth frame into
+            # the side-channel shm and bump rgbd_seq. The camera-depth backend
+            # (when selected) reads from there instead of running an NN.
+            depth_stream_arr = shm.depth_stream_arr()
+            if depth_stream_arr is not None:
+                if hasattr(cam, "get_depth"):
+                    depth_m = cam.get_depth()
+                    if depth_m is not None:
+                        depth_stream_arr[...] = depth_m
+                        with shm.rgbd_seq.get_lock():
+                            shm.rgbd_seq.value += 1
+                # Sim mode: the sim worker writes depth_stream + rgbd_seq
+                # directly (task 17), nothing to do here.
+
+            with shm.rgb_seq.get_lock():
+                cur_rgb = shm.rgb_seq.value
+            if cur_rgb != last_rgb_seq:
+                last_rgb_seq = cur_rgb
+                bgr = cv2.cvtColor(rgb_buf, cv2.COLOR_RGB2BGR)
+                await hub.broadcast(encode_jpeg(seq, bgr))
                 seq += 1
                 n_rgb += 1
 
@@ -616,30 +883,37 @@ async def main_async(args) -> None:
                     n = shm.pc_count.value
                 with shm.has_normal.get_lock():
                     have_n = bool(shm.has_normal.value)
-                normal_payload = mesh_normal.copy() if have_n else None
+                # Recompute T_world_camera every frame so live calibration
+                # updates ripple through immediately.
+                T_wc = sess["calib"].T_world_camera()
+                normal_payload = (
+                    _xform_normals(mesh_normal, T_wc) if have_n else None
+                )
                 if n > 0:
                     pc_mask = seg_mask[pc_grid_idx[:n]].copy()
+                    pc_world = _xform_points(pc_xyz[:n], T_wc)
+                    mesh_world = _xform_points(mesh_xyz, T_wc, mask_zero=True)
                     await hub.broadcast(
-                        _frame_points(seq, pc_xyz[:n].copy(), pc_rgb[:n].copy(),
+                        encode_points(seq, pc_world, pc_rgb[:n].copy(),
                                       mask=pc_mask)
                     )
                     seq += 1
                     await hub.broadcast(
-                        _frame_mesh(seq, mesh_xyz.copy(), mesh_rgb.copy(),
+                        encode_mesh(seq, mesh_world, mesh_rgb.copy(),
                                     mesh_faces.copy(), normal=normal_payload)
                     )
                     seq += 1
                 # Always send a colorized depth jpeg, even when pc is empty.
                 depth_bgr = _depth_to_turbo_bgr(depth_buf)
                 await hub.broadcast(
-                    _frame_jpeg(seq, depth_bgr, kind=KIND_DEPTH_JPEG, quality=80)
+                    encode_jpeg(seq, depth_bgr, kind=KIND_DEPTH_JPEG, quality=80)
                 )
                 seq += 1
                 # And a normal-map jpeg if the model produces normals.
                 if have_n:
                     normal_bgr = _normal_to_bgr(normal_img)
                     await hub.broadcast(
-                        _frame_jpeg(seq, normal_bgr, kind=KIND_NORMAL_JPEG, quality=80)
+                        encode_jpeg(seq, normal_bgr, kind=KIND_NORMAL_JPEG, quality=80)
                     )
                     seq += 1
                 n_depth += 1
@@ -658,9 +932,19 @@ async def main_async(args) -> None:
                 box_min = seg_bbox[0:3].copy()
                 box_max = seg_bbox[3:6].copy()
                 await hub.broadcast(
-                    _frame_mask(seq, cur_m, seg_mask.copy(), has_box, box_min, box_max)
+                    encode_mask(seq, cur_m, seg_mask.copy(), has_box, box_min, box_max)
                 )
                 seq += 1
+
+            # Robot transforms — broadcast whenever qpos_seq advances.
+            if robot["enabled"] and robot["shm"] is not None:
+                cur_q = robot["shm"].read_seq()
+                if cur_q != robot["last_seq"]:
+                    robot["last_seq"] = cur_q
+                    qpos = robot["shm"].read_qpos()
+                    xpos, xquat = robot["fk"].compute(qpos)
+                    await hub.broadcast(encode_robot_transforms(seq, xpos, xquat))
+                    seq += 1
 
             if time.time() - t_log >= 1.0:
                 dt = time.time() - t_log
@@ -668,7 +952,7 @@ async def main_async(args) -> None:
                 depth_fps = n_depth / dt
                 print(f"[ws] rgb {rgb_fps:.1f}  depth {depth_fps:.1f}  "
                       f"clients={len(hub.clients)}", flush=True)
-                await hub.broadcast(_frame_stats(seq, {
+                await hub.broadcast(encode_stats(seq, {
                     "rgb_fps":   round(rgb_fps, 1),
                     "depth_fps": round(depth_fps, 1),
                     "sam_ms":    sam_last_ms["v"],
@@ -686,6 +970,9 @@ async def main_async(args) -> None:
     try:
         await asyncio.gather(ws_loop(), stream_loop())
     finally:
+        if robot["src"] is not None:
+            robot["src"].stop()
+        stop_sim()
         stop_seg()
         stop_depth()
         teardown_session()
@@ -703,7 +990,35 @@ def main() -> None:
                     help="Initial input source ('live' uses --camera; 'video' picks --video).")
     ap.add_argument("--video", default=None,
                     help="Video filename inside dataset/videos/ to start with.")
+    ap.add_argument("--mjcf", default=None,
+                    help="Path to an MJCF scene to display a robot. "
+                         "If omitted, no robot is rendered.")
+    ap.add_argument("--robot-source", default="none",
+                    choices=["none", "dummy", "sim"],
+                    dest="robot_source",
+                    help="Where qpos comes from. 'none' = stays at home. "
+                         "'dummy' = sine animation (test only). 'sim' = MuJoCo "
+                         "physics process; implied by --mode sim.")
+    ap.add_argument("--mode", default="real", choices=["real", "sim"],
+                    help="'real' uses a physical camera (RealSense or HTTP). "
+                         "'sim' replaces the camera with a MuJoCo render of "
+                         "--mjcf and runs physics in a worker process.")
+    ap.add_argument("--sim-camera", default="ext_rgbd",
+                    dest="sim_camera",
+                    help="Named MJCF camera to render in sim mode.")
+    ap.add_argument("--mujoco-gui", action="store_true", dest="mujoco_gui",
+                    help="Open the MuJoCo native passive viewer alongside "
+                         "the web frontend (sim mode only).")
     args = ap.parse_args()
+    if args.robot_source != "none" and not args.mjcf:
+        ap.error("--robot-source requires --mjcf")
+    if args.mode == "sim":
+        if not args.mjcf:
+            ap.error("--mode sim requires --mjcf")
+        # Sim mode is its own qpos producer.
+        args.robot_source = "sim"
+    if args.mujoco_gui and args.mode != "sim":
+        ap.error("--mujoco-gui requires --mode sim")
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:

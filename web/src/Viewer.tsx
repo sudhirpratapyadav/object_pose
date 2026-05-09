@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { RobotRenderer } from "./RobotRenderer";
 import { StreamState } from "./useStream";
 
 type Props = {
@@ -10,6 +11,7 @@ type Props = {
   display: "points" | "mesh" | "both";
   showCamera: boolean;
   showBBox: boolean;
+  showRobot: boolean;
 };
 
 const POINT_VS = /* glsl */ `
@@ -42,10 +44,10 @@ void main() {
   gl_FragColor = vec4(c, 1.0);
 }`;
 
-export function Viewer({ stream, pointSize, inversePerspective, display, showCamera, showBBox }: Props) {
+export function Viewer({ stream, pointSize, inversePerspective, display, showCamera, showBBox, showRobot }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera, showBBox });
-  propsRef.current = { pointSize, inversePerspective, display, showCamera, showBBox };
+  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera, showBBox, showRobot });
+  propsRef.current = { pointSize, inversePerspective, display, showCamera, showBBox, showRobot };
   // Mirror `stream` into a ref so the (mount-only) effect always sees the
   // latest meta + state objects, not the ones captured at mount.
   const streamRef = useRef(stream);
@@ -61,8 +63,9 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.01, 100);
-    camera.position.set(0, 0, -1.5);
-    camera.up.set(0, -1, 0);
+    // World is Z-up (MuJoCo); look at origin from above-and-to-the-side.
+    camera.position.set(1.5, -1.5, 1.0);
+    camera.up.set(0, 0, 1);
     camera.lookAt(0, 0, 0);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -74,6 +77,19 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     // World axes at origin
     const axes = new THREE.AxesHelper(0.15);
     scene.add(axes);
+
+    // Lights for the MJCF robot (MeshLambertMaterial). Other point/mesh
+    // surfaces use ShaderMaterials and are unaffected.
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+    dirLight.position.set(0.5, -1.0, -0.5);
+    scene.add(dirLight);
+
+    // Robot (optional — populated when KIND_ROBOT_GEOMETRY arrives).
+    const robot = new RobotRenderer();
+    scene.add(robot.root);
+    let lastRobotGeomSeq = -1, lastRobotXformSeq = -1;
 
     // Bounding box for the segmented region.
     // Bbox lines: build from raw vertices each time mask updates. Box3Helper's
@@ -108,11 +124,22 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       (bboxGeom.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
       bboxGeom.computeBoundingSphere();
     };
-    // Camera frustum (placeholder; sized later when meta arrives)
+    // Camera pose = world frame of the physical camera, set from cam_calib.
+    // The frustum geometry is in camera-local coordinates; we parent it
+    // under cameraPose so the whole rig moves with the calibration.
+    const cameraPose = new THREE.Group();
+    cameraPose.name = "camera-pose";
+    scene.add(cameraPose);
+
+    // Camera-local axes (small, on the camera body itself).
+    const camAxes = new THREE.AxesHelper(0.08);
+    cameraPose.add(camAxes);
+
+    // Camera frustum (placeholder; sized later when meta arrives).
     const frustumGeom = new THREE.BufferGeometry();
     const frustumMat = new THREE.LineBasicMaterial({ color: 0x33cc55 });
     const frustum = new THREE.LineSegments(frustumGeom, frustumMat);
-    scene.add(frustum);
+    cameraPose.add(frustum);
 
     // Points
     const pointsGeom = new THREE.BufferGeometry();
@@ -240,17 +267,21 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       const hits = raycaster.intersectObjects(targets, false);
       if (!hits.length) return;
       const hit = hits[0];
-      const p = hit.point;       // already in scene/camera-frame world coords
+      const p = hit.point;       // world frame
 
       // Show the ping at the hit point.
       ping.position.copy(p);
       ping.visible = true;
       pingT0 = performance.now();
 
-      // Project to inference-frame pixel coords.
-      const z = Math.max(p.z, 1e-3);
-      const u_inf = meta.fx_infer * (p.x / z) + meta.cx_infer;
-      const v_inf = meta.fy_infer * (p.y / z) + meta.cy_infer;
+      // Convert world hit -> camera frame for the pinhole projection.
+      cameraPose.updateMatrixWorld();
+      const pCam = p.clone().applyMatrix4(
+        new THREE.Matrix4().copy(cameraPose.matrixWorld).invert()
+      );
+      const z = Math.max(pCam.z, 1e-3);
+      const u_inf = meta.fx_infer * (pCam.x / z) + meta.cx_infer;
+      const v_inf = meta.fy_infer * (pCam.y / z) + meta.cy_infer;
       const x = Math.round(Math.max(0, Math.min(meta.infer_w - 1, u_inf)));
       const y = Math.round(Math.max(0, Math.min(meta.infer_h - 1, v_inf)));
       streamRef.current.samClick(x, y);
@@ -269,13 +300,14 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     window.addEventListener("resize", onResize);
 
     let lastPointsSeq = -1, lastMeshSeq = -1, lastMaskSeq = -1;
-    let metaApplied = false;
+    let frustumBuilt = false;
+    let lastCalibKey = "";
 
     const animate = () => {
-      // Apply meta -> frustum once
-      if (!metaApplied && streamRef.current.meta) {
-        metaApplied = true;
-        const m = streamRef.current.meta;
+      // Build the frustum geometry the first time intrinsics arrive.
+      const m = streamRef.current.meta;
+      if (!frustumBuilt && m) {
+        frustumBuilt = true;
         const scale = 0.3;
         const corners: [number, number, number][] = [
           [(0       - m.cx) / m.fx * scale, (0       - m.cy) / m.fy * scale, scale],
@@ -292,12 +324,28 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         frustumGeom.setAttribute("position", new THREE.Float32BufferAttribute(segs, 3));
       }
 
+      // Apply T_world_camera to the cameraPose group whenever calibration
+      // changes (live updates flow via KIND_CAM_CALIB into camCalibRef).
+      const cc0 = streamRef.current.camCalibRef.current;
+      if (cc0) {
+        const cc = cc0.extrinsics;
+        const key = `${cc.pos_world.join(",")}|${cc.quat_wxyz.join(",")}`;
+        if (key !== lastCalibKey) {
+          lastCalibKey = key;
+          cameraPose.position.set(cc.pos_world[0], cc.pos_world[1], cc.pos_world[2]);
+          // wxyz -> xyzw
+          cameraPose.quaternion.set(
+            cc.quat_wxyz[1], cc.quat_wxyz[2], cc.quat_wxyz[3], cc.quat_wxyz[0]
+          );
+        }
+      }
+
       // Toggles (read via ref so prop changes apply without remount)
       const p = propsRef.current;
       points.visible = p.display === "points" || p.display === "both";
       mesh.visible = p.display === "mesh" || p.display === "both";
-      axes.visible = p.showCamera;
-      frustum.visible = p.showCamera;
+      axes.visible = p.showCamera;          // world axes at origin
+      cameraPose.visible = p.showCamera;     // camera body (frustum + cam-local axes)
       uniforms.uBaseSize.value = p.pointSize;
       uniforms.uInversePerspective.value = p.inversePerspective ? 1.0 : 0.0;
 
@@ -353,6 +401,19 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         meshGeom.computeBoundingSphere();
       }
 
+      // Robot — apply geometry first (one-shot), then per-frame transforms.
+      const rg = streamRef.current.robotGeomRef.current;
+      if (rg && rg.seq !== lastRobotGeomSeq) {
+        lastRobotGeomSeq = rg.seq;
+        robot.setGeometry(rg.bodies, rg.meshes, rg.geoms, rg.blob);
+      }
+      const rx = streamRef.current.robotXformRef.current;
+      if (rx && rx.seq !== lastRobotXformSeq) {
+        lastRobotXformSeq = rx.seq;
+        robot.setTransforms(rx.xpos, rx.xquat, rx.nbody);
+      }
+      robot.setVisible(propsRef.current.showRobot);
+
       // Animate the click-feedback ping (grow + fade over 400ms).
       if (ping.visible) {
         const t = (performance.now() - pingT0) / 400;
@@ -389,6 +450,7 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       bboxMat.dispose();
       pingGeom.dispose();
       pingMat.dispose();
+      robot.dispose();
       container.removeChild(renderer.domElement);
     };
     // We intentionally only run this effect once; values are read via refs/closure

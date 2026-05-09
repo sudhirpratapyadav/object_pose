@@ -20,7 +20,9 @@ from multiprocessing import shared_memory
 import numpy as np
 from PIL import Image
 
-from .backends import DEFAULT_MODEL, make_backend
+from .backends import (
+    CAMERA_DEPTH_KEY, DEFAULT_MODEL, make_backend, make_camera_backend,
+)
 from .mesh import build_faces, fill_mesh, grid_dims, precompute_unproject
 
 PC_DOWNSAMPLE = 4
@@ -41,8 +43,13 @@ class DepthShm:
     mesh_faces: shared_memory.SharedMemory
     mesh_normal: shared_memory.SharedMemory  # (n_verts, 3) float32, may be all zeros
     normal_img: shared_memory.SharedMemory   # (infer_h, infer_w, 3) float32 normal map
+    # Camera-supplied depth stream (RealSense aligned depth or sim render).
+    # Created at native rgb resolution so the camera writes without resizing.
+    # None if the camera doesn't produce depth.
+    depth_stream: shared_memory.SharedMemory | None
     rgb_seq:   mp.Value
     depth_seq: mp.Value
+    rgbd_seq:  mp.Value      # bumped each time depth_stream is written
     pc_count:  mp.Value
     has_normal: mp.Value
     rgb_w:    int
@@ -88,23 +95,34 @@ class DepthShm:
         return np.ndarray((self.infer_h, self.infer_w, 3), dtype=np.float32,
                           buffer=self.normal_img.buf)
 
+    def depth_stream_arr(self) -> np.ndarray | None:
+        """Camera-native depth (metres). Shape: (rgb_h, rgb_w). None if not allocated."""
+        if self.depth_stream is None:
+            return None
+        return np.ndarray((self.rgb_h, self.rgb_w), dtype=np.float32,
+                          buffer=self.depth_stream.buf)
+
+    def _all_shms(self):
+        out = [self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+               self.pc_grid_idx,
+               self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
+               self.mesh_normal, self.normal_img]
+        if self.depth_stream is not None:
+            out.append(self.depth_stream)
+        return out
+
     def close(self):
-        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
-                    self.pc_grid_idx,
-                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
-                    self.mesh_normal, self.normal_img):
+        for shm in self._all_shms():
             shm.close()
 
     def unlink(self):
-        for shm in (self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
-                    self.pc_grid_idx,
-                    self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
-                    self.mesh_normal, self.normal_img):
+        for shm in self._all_shms():
             try: shm.unlink()
             except FileNotFoundError: pass
 
 
-def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
+def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int,
+               with_depth_stream: bool = False) -> DepthShm:
     n_max = (infer_w // PC_DOWNSAMPLE) * (infer_h // PC_DOWNSAMPLE)
     grid_w, grid_h = grid_dims(infer_w, infer_h, MESH_DOWNSAMPLE)
     n_verts = grid_w * grid_h
@@ -120,13 +138,17 @@ def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int) -> DepthShm:
     mesh_faces = shared_memory.SharedMemory(create=True, size=n_faces * 3 * 4)
     mesh_normal = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     normal_img  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 3 * 4)
+    depth_stream = (shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w * 4)
+                    if with_depth_stream else None)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
         pc_grid_idx=pc_grid_idx,
         mesh_xyz=mesh_xyz, mesh_rgb=mesh_rgb, mesh_faces=mesh_faces,
         mesh_normal=mesh_normal, normal_img=normal_img,
+        depth_stream=depth_stream,
         rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
+        rgbd_seq=mp.Value("Q", 0),
         pc_count=mp.Value("I", 0),
         has_normal=mp.Value("B", 0),
         rgb_w=rgb_w, rgb_h=rgb_h,
@@ -152,6 +174,9 @@ def depth_worker(
     status_q=None,
     model_key: str = DEFAULT_MODEL,
     device: str = "cuda",
+    # Camera-depth side channel: only used when model_key == 'camera-depth'.
+    depth_stream_name: str | None = None,
+    depth_stream_label: str = "Camera depth",
 ):
     """Inference runs at (infer_w, infer_h). Intrinsics fx/fy/cx/cy are in the
     inference frame (already scaled by caller)."""
@@ -190,7 +215,21 @@ def depth_worker(
                 mesh_normal_shm, normal_img_shm)
 
     try:
-        backend = make_backend(model_key, focal_px=float(fx))
+        if model_key == CAMERA_DEPTH_KEY:
+            if not depth_stream_name:
+                raise RuntimeError(
+                    "camera-depth selected but the camera does not provide a "
+                    "depth stream (no RealSense depth, sim mode off, or video "
+                    "source). Pick a different model."
+                )
+            backend = make_camera_backend(
+                depth_stream_label,
+                depth_shm_name=depth_stream_name,
+                src_w=rgb_w, src_h=rgb_h,
+                infer_w=infer_w, infer_h=infer_h,
+            )
+        else:
+            backend = make_backend(model_key, focal_px=float(fx))
         backend.load(status, device=device)
     except Exception as exc:
         msg = str(exc)

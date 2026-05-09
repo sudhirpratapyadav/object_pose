@@ -1,0 +1,4 @@
+extrinsics:
+  pos: [1.0, 0.0, 0.5]
+  euler_deg: [70.0, 0.0, 90.0]
+intrinsics: {fovy: 60.0, width: 640, height: 480}
