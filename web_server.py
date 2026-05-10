@@ -632,6 +632,7 @@ async def main_async(args) -> None:
                 depth_stream_name, depth_label,
             ),
             kwargs=dict(
+                rgbd_seq=shm.rgbd_seq,
                 ir_left_name=ir_left_name,
                 ir_right_name=ir_right_name,
                 stereo_seq=stereo_seq,
@@ -1649,36 +1650,50 @@ async def main_async(args) -> None:
                     await hub.broadcast(encode_log_lines(seq, batch))
                     seq += 1
 
+            # Snapshot the entire depth-worker output under depth_seq's
+            # lock so we don't read a partially-written buffer. The depth
+            # worker bumps depth_seq LAST after a successful publish, and
+            # holds this same lock while writing — so we either see the
+            # previous full frame or the new one, never a mix.
+            fresh = False
             with shm.depth_seq.get_lock():
                 cur = shm.depth_seq.value
-            if cur != last_depth_seq:
-                last_depth_seq = cur
-                with shm.pc_count.get_lock():
+                fresh = cur != last_depth_seq
+                if fresh:
+                    last_depth_seq = cur
                     n = shm.pc_count.value
-                with shm.has_normal.get_lock():
                     have_n = bool(shm.has_normal.value)
+                    # Copy everything we need OUT of shm before releasing.
+                    pc_xyz_snap   = pc_xyz[:n].copy()  if n > 0 else None
+                    pc_rgb_snap   = pc_rgb[:n].copy()  if n > 0 else None
+                    pc_idx_snap   = pc_grid_idx[:n].copy() if n > 0 else None
+                    mesh_xyz_snap   = mesh_xyz.copy()
+                    mesh_rgb_snap   = mesh_rgb.copy()
+                    mesh_faces_snap = mesh_faces.copy()
+                    mesh_normal_snap = mesh_normal.copy() if have_n else None
+                    depth_buf_snap  = depth_buf.copy()
+            if fresh:
                 # Recompute T_world_camera every frame so live calibration
                 # updates ripple through immediately.
                 T_wc = sess["calib"].T_world_camera()
                 normal_payload = (
-                    _xform_normals(mesh_normal, T_wc) if have_n else None
+                    _xform_normals(mesh_normal_snap, T_wc) if have_n else None
                 )
                 if n > 0:
-                    pc_mask = seg_mask[pc_grid_idx[:n]].copy()
-                    pc_world = _xform_points(pc_xyz[:n], T_wc)
-                    mesh_world = _xform_points(mesh_xyz, T_wc, mask_zero=True)
+                    pc_mask = seg_mask[pc_idx_snap].copy()
+                    pc_world = _xform_points(pc_xyz_snap, T_wc)
+                    mesh_world = _xform_points(mesh_xyz_snap, T_wc, mask_zero=True)
                     await hub.broadcast(
-                        encode_points(seq, pc_world, pc_rgb[:n].copy(),
-                                      mask=pc_mask)
+                        encode_points(seq, pc_world, pc_rgb_snap, mask=pc_mask)
                     )
                     seq += 1
                     await hub.broadcast(
-                        encode_mesh(seq, mesh_world, mesh_rgb.copy(),
-                                    mesh_faces.copy(), normal=normal_payload)
+                        encode_mesh(seq, mesh_world, mesh_rgb_snap,
+                                    mesh_faces_snap, normal=normal_payload)
                     )
                     seq += 1
                 # Always send a colorized depth jpeg, even when pc is empty.
-                depth_bgr = _depth_to_turbo_bgr(depth_buf)
+                depth_bgr = _depth_to_turbo_bgr(depth_buf_snap)
                 await hub.broadcast(
                     encode_jpeg(seq, depth_bgr, kind=KIND_DEPTH_JPEG, quality=80)
                 )

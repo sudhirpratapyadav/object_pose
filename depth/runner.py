@@ -200,6 +200,7 @@ def depth_worker(
     # Camera-depth side channel: only used when model_key == 'camera-depth'.
     depth_stream_name: str | None = None,
     depth_stream_label: str = "Camera depth",
+    rgbd_seq=None,
     # Stereo side channels: only used when the backend is FoundationStereo.
     # The 'stereo_calib' dict carries IR intrinsics + baseline + IR->color
     # extrinsics for projecting points into the color frame.
@@ -257,6 +258,7 @@ def depth_worker(
                 depth_shm_name=depth_stream_name,
                 src_w=rgb_w, src_h=rgb_h,
                 infer_w=infer_w, infer_h=infer_h,
+                rgbd_seq=rgbd_seq,
             )
         elif model_key in FOUNDATION_STEREO_KEYS:
             if not (ir_left_name and ir_right_name and stereo_calib):
@@ -339,14 +341,18 @@ def depth_worker(
         flat_idx = np.flatnonzero(valid.ravel()).astype(np.uint32)
         n = min(len(pts), n_max)
 
-        depth_arr[...] = d
-        pc_xyz_arr[:n] = pts[:n]
-        pc_rgb_arr[:n] = cols[:n]
-        pc_grid_idx_arr[:n] = flat_idx[:n]
-
+        # Compute the per-frame mesh + (optional) normal-image into local
+        # buffers first, so the cross-process publish below can copy
+        # everything into shm under a single lock without holding it
+        # during heavy work.
         n_grid_for_fill = None
         if n_img is not None and n_img.shape[:2] == (infer_h, infer_w):
             n_grid_for_fill = n_img[::MESH_DOWNSAMPLE, ::MESH_DOWNSAMPLE]
+        # fill_mesh writes into mesh_*_arr; allocate shadow buffers so we
+        # can hold the lock briefly during the swap-in.
+        local_mesh_xyz   = np.empty_like(mesh_xyz_arr)
+        local_mesh_rgb   = np.empty_like(mesh_rgb_arr)
+        local_mesh_faces = np.empty_like(mesh_faces_arr)
         fill_mesh(
             d, rgb_inf,
             mesh_x_norm, mesh_y_norm,
@@ -354,12 +360,11 @@ def depth_worker(
             MESH_DOWNSAMPLE,
             PC_MIN_M, PC_MAX_M,
             MESH_EDGE_THRESHOLD_M,
-            mesh_xyz_arr, mesh_rgb_arr, mesh_faces_arr,
+            local_mesh_xyz, local_mesh_rgb, local_mesh_faces,
             normal_grid=n_grid_for_fill,
         )
 
-        # Normals: write the inference-frame map to normal_img and the
-        # downsampled grid to mesh_normal. has_normal toggles per frame.
+        # Optional normal-image upsample (kept outside the lock).
         if n_img is not None:
             if n_img.shape[:2] != (infer_h, infer_w):
                 from PIL import Image as _I
@@ -368,16 +373,38 @@ def depth_worker(
                     ch.append(np.asarray(_I.fromarray(n_img[..., c]).resize(
                         (infer_w, infer_h), _I.BILINEAR)))
                 n_img = np.stack(ch, axis=-1)
-            normal_img_arr[...] = n_img.astype(np.float32)
-            n_grid = n_img[::MESH_DOWNSAMPLE, ::MESH_DOWNSAMPLE]
-            mesh_normal_arr[...] = n_grid.reshape(-1, 3).astype(np.float32)
-            with has_normal_flag.get_lock(): has_normal_flag.value = 1
+            local_normal_img = n_img.astype(np.float32)
+            local_mesh_normal = (n_img[::MESH_DOWNSAMPLE, ::MESH_DOWNSAMPLE]
+                                  .reshape(-1, 3).astype(np.float32))
         else:
-            with has_normal_flag.get_lock(): has_normal_flag.value = 0
+            local_normal_img = None
+            local_mesh_normal = None
 
-        with pc_count.get_lock():
-            pc_count.value = n
+        # Cross-process publish: take depth_seq's lock for the entire
+        # buffer swap so the broadcast loop (which holds the same lock
+        # while copying out) never reads a torn frame. depth_seq is the
+        # publish-fence — it advances LAST, so a reader that locks here
+        # gets the previous-fully-written frame or the new one, never a
+        # mix. Only depth_seq.get_lock() needs to be held by the
+        # broadcaster — we use the others (pc_count, has_normal) just
+        # to keep the writer's API consistent, but readers should always
+        # gate on depth_seq.
         with depth_seq.get_lock():
+            depth_arr[...] = d
+            pc_xyz_arr[:n] = pts[:n]
+            pc_rgb_arr[:n] = cols[:n]
+            pc_grid_idx_arr[:n] = flat_idx[:n]
+            mesh_xyz_arr[...]   = local_mesh_xyz
+            mesh_rgb_arr[...]   = local_mesh_rgb
+            mesh_faces_arr[...] = local_mesh_faces
+            if local_normal_img is not None:
+                normal_img_arr[...] = local_normal_img
+                mesh_normal_arr[...] = local_mesh_normal
+                with has_normal_flag.get_lock(): has_normal_flag.value = 1
+            else:
+                with has_normal_flag.get_lock(): has_normal_flag.value = 0
+            with pc_count.get_lock():
+                pc_count.value = n
             depth_seq.value = depth_seq.value + 1
 
     for shm in all_shms:
