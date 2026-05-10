@@ -24,6 +24,7 @@ KIND_NORMAL_JPEG      = 9
 KIND_ROBOT_GEOMETRY   = 10
 KIND_ROBOT_TRANSFORMS = 11
 KIND_CAM_CALIB        = 12
+KIND_ROBOT_STATUS     = 13
 
 
 def pack_header(seq: int, kind: int) -> bytes:
@@ -129,6 +130,11 @@ def encode_robot_geometry(seq: int, bodies: list[dict], meshes: list[dict],
 def encode_cam_calib(seq: int, payload: dict) -> bytes:
     """Live update of the active camera calibration (pos + euler + intrinsics)."""
     return pack_header(seq, KIND_CAM_CALIB) + json.dumps(payload).encode("utf-8")
+
+
+def encode_robot_status(seq: int, payload: dict) -> bytes:
+    """1 Hz robot status: OSC rate, mode, error string, etc."""
+    return pack_header(seq, KIND_ROBOT_STATUS) + json.dumps(payload).encode("utf-8")
 
 
 def encode_robot_transforms(seq: int, xpos: np.ndarray, xquat: np.ndarray) -> bytes:

@@ -3,12 +3,18 @@
 MoGe-2 predicts a metric 3D point map directly. We only need the Z-channel
 to slot into the existing depth/pc pipeline.
 
+We pass ``fov_x`` (derived from the YAML cam_calib intrinsics) to MoGe so
+its predicted depth is consistent with the camera the rest of the pipeline
+believes in. Without this hint MoGe estimates its own FOV, which can
+disagree with the YAML and bias the back-projection.
+
 Repo:   https://github.com/microsoft/MoGe
 Models: facebook/sam2-style, hosted on HF under 'Ruicheng/<key>'.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -18,9 +24,18 @@ from .base import BackendInfo, DepthBackend, StatusFn
 
 
 class MoGeBackend:
-    def __init__(self, info: BackendInfo, weights_root: Path):
+    def __init__(self, info: BackendInfo, weights_root: Path,
+                 focal_px: float | None = None):
         self.info = info
         self.weights_dir = weights_root / info.key
+        # Horizontal FOV in degrees, derived from the calibrated focal length
+        # and the inference width. None if we don't know — MoGe will estimate.
+        if focal_px and focal_px > 0:
+            self._fov_x_deg = math.degrees(
+                2.0 * math.atan(0.5 * info.infer_w / float(focal_px))
+            )
+        else:
+            self._fov_x_deg = None
         self._model = None
         self._device = "cuda"
 
@@ -53,6 +68,12 @@ class MoGeBackend:
             dummy = torch.zeros(3, self.info.infer_h, self.info.infer_w,
                                 dtype=torch.float32, device=device)
             self._model.infer(dummy)
+        if self._fov_x_deg is not None:
+            print(f"[depth] {self.info.key} fov_x={self._fov_x_deg:.2f}° "
+                  f"(from cam_calib)", flush=True)
+        else:
+            print(f"[depth] {self.info.key} fov_x=auto (MoGe estimates it)",
+                  flush=True)
         print(f"[depth] {self.info.key} ready in {time.time()-t0:.1f}s", flush=True)
         status("ready")
 
@@ -61,7 +82,37 @@ class MoGeBackend:
         # MoGe expects (3, H, W) float in [0, 1].
         rgb_t = torch.from_numpy(rgb).to(self._device).permute(2, 0, 1).float() / 255.0
         with torch.no_grad():
-            out = self._model.infer(rgb_t)
+            out = self._model.infer(rgb_t, fov_x=self._fov_x_deg)
+
+        # One-shot diagnostic: log MoGe's reported intrinsics + depth stats so
+        # we can verify the model honoured the fov_x we passed (vs estimating
+        # its own). MoGe's 'intrinsics' is in normalized image coords
+        # (fx = focal / width). Suppress after the first frame.
+        if not getattr(self, "_logged_intr", False):
+            self._logged_intr = True
+            try:
+                if "intrinsics" in out and out["intrinsics"] is not None:
+                    K = out["intrinsics"].detach().cpu().numpy()
+                    fx_n = float(K[..., 0, 0])
+                    fy_n = float(K[..., 1, 1])
+                    fx_px = fx_n * self.info.infer_w
+                    fy_px = fy_n * self.info.infer_h
+                    print(f"[depth] {self.info.key} reported fx={fx_px:.1f}px "
+                          f"fy={fy_px:.1f}px (normalized {fx_n:.4f},{fy_n:.4f})",
+                          flush=True)
+                d_dbg = (out["depth"] if "depth" in out and out["depth"] is not None
+                         else out["points"][..., 2])
+                d_np = d_dbg.detach().cpu().numpy()
+                d_finite = d_np[np.isfinite(d_np)]
+                if d_finite.size:
+                    print(f"[depth] {self.info.key} depth stats "
+                          f"min={float(d_finite.min()):.3f} "
+                          f"max={float(d_finite.max()):.3f} "
+                          f"med={float(np.median(d_finite)):.3f} m",
+                          flush=True)
+            except Exception as exc:
+                print(f"[depth] {self.info.key} diag log failed: {exc}",
+                      flush=True)
 
         # Depth
         if "depth" in out and out["depth"] is not None:

@@ -24,6 +24,7 @@ export class RobotRenderer {
   private bodyNodes: THREE.Object3D[] = [];
   private materials: THREE.Material[] = [];
   private geometries: THREE.BufferGeometry[] = [];
+  private eeAxes: THREE.AxesHelper | null = null;
 
   constructor() {
     this.root = new THREE.Group();
@@ -35,9 +36,13 @@ export class RobotRenderer {
   /**
    * Build (or rebuild) the scene-graph from a one-shot geometry payload.
    * Disposes any previously-built nodes.
+   *
+   * ``eeBodyIdx`` (>=0) parents an AxesHelper under that body so it follows
+   * the EE pose automatically. -1 disables the helper.
    */
   setGeometry(bodies: RobotBody[], meshes: RobotMeshIndex[],
-              geoms: RobotGeom[], blob: ArrayBuffer): void {
+              geoms: RobotGeom[], blob: ArrayBuffer,
+              eeBodyIdx: number = -1): void {
     this.dispose();
 
     // Build per-body groups, indexed by body id. We use a flat layout (each
@@ -82,6 +87,18 @@ export class RobotRenderer {
       obj.quaternion.set(g.quat[1], g.quat[2], g.quat[3], g.quat[0]);
       this.bodyNodes[g.body].add(obj);
     }
+
+    // EE axes: parent under the chosen body so its world transform follows
+    // automatically each frame.
+    if (eeBodyIdx >= 0 && eeBodyIdx < this.bodyNodes.length) {
+      this.eeAxes = new THREE.AxesHelper(0.12);
+      this.eeAxes.name = "ee-axes";
+      this.bodyNodes[eeBodyIdx].add(this.eeAxes);
+    }
+  }
+
+  setEeAxesVisible(v: boolean): void {
+    if (this.eeAxes) this.eeAxes.visible = v;
   }
 
   /**
@@ -115,6 +132,10 @@ export class RobotRenderer {
       this.root.remove(n);
     }
     this.bodyNodes = [];
+    if (this.eeAxes) {
+      this.eeAxes.dispose();
+      this.eeAxes = null;
+    }
     for (const g of this.geometries) g.dispose();
     this.geometries = [];
     for (const m of this.materials) m.dispose();

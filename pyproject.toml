@@ -21,16 +21,26 @@ dependencies = [
     "opencv-python>=4.8",
     "websockets>=12",
     "pyyaml>=6.0",
+    "pin>=3.9",            # Pinocchio (rigid-body dynamics, used by hardware/osc.py)
 ]
 
 [project.optional-dependencies]
-# Both heavy backends are loaded at runtime and have problematic build deps;
+# Heavy backends are loaded at runtime and have problematic build deps;
 # install them manually if you want to enable those entries:
+#   MoGe / MoGe-2:
+#     uv pip install --no-build-isolation \
+#       "moge @ git+https://github.com/microsoft/MoGe.git"
 #   UniDepth V2:
 #     uv pip install --no-build-isolation \
 #       "unidepth @ git+https://github.com/lpiccinelli-eth/UniDepth.git"
 #   Metric3D V2 (torch.hub, may also need mmcv depending on the variant):
 #     uv pip install timm
+#
+# Kinova hardware (real-robot mode only). kortex_api isn't on PyPI; the
+# wheel Kinova ships is bundled in wheels/. On Python 3.13 you also need
+# to pin protobuf (the wheel's metadata allows 3.5.1 which breaks).
+#     uv pip install ./wheels/kortex_api-2.6.0.post3-py3-none-any.whl
+#     uv pip install "protobuf==3.20.0"
 extras = ["timm>=0.9"]
 
 [build-system]

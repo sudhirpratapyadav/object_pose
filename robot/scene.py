@@ -70,6 +70,8 @@ class RobotScene:
     geoms: list[GeomInfo]
     nq: int
     actuators: list[ActuatorInfo]
+    ee_body_idx: int       # body whose world transform represents the EE
+    ee_body_name: str
 
     def home_qpos(self) -> np.ndarray:
         # If a 'home' keyframe exists, use it; else neutral (zeros for hinge joints).
@@ -174,8 +176,40 @@ def load_robot_scene(mjcf_path: str | Path) -> RobotScene:
         geoms.append(info)
 
     actuators = _actuator_info(model)
+    ee_idx, ee_name = _pick_ee_body(model, bodies)
     return RobotScene(mjcf_path=mjcf_path, model=model, bodies=bodies,
-                      geoms=geoms, nq=int(model.nq), actuators=actuators)
+                      geoms=geoms, nq=int(model.nq), actuators=actuators,
+                      ee_body_idx=ee_idx, ee_body_name=ee_name)
+
+
+# Common end-effector body names, in priority order. The first match wins.
+_EE_BODY_PREFERENCE = (
+    "end_effector_link",   # Kinova Gen3 convention (this repo's MJCF)
+    "ee_link",
+    "tcp",
+    "tool0",
+    "wrist_link",
+    "bracelet_link",
+)
+
+
+def _pick_ee_body(model: mujoco.MjModel,
+                  bodies: list[BodyInfo]) -> tuple[int, str]:
+    """Pick a body to display the EE axes at.
+
+    Strategy: prefer well-known names; otherwise fall back to the deepest
+    body in the kinematic chain (likely the leaf of the arm).
+    """
+    by_name = {b.name: b.id for b in bodies}
+    for name in _EE_BODY_PREFERENCE:
+        if name in by_name:
+            return by_name[name], name
+    # Fallback: pick the body whose ancestry chain to world is longest.
+    depth = [0] * model.nbody
+    for i in range(1, model.nbody):
+        depth[i] = depth[int(model.body_parentid[i])] + 1
+    leaf = int(np.argmax(depth))
+    return leaf, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, leaf) or f"body_{leaf}"
 
 
 def _geom_color(model: mujoco.MjModel, geom_idx: int) -> np.ndarray:

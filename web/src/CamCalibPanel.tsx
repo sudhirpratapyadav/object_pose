@@ -54,9 +54,10 @@ export function CamCalibPanel({ stream }: Props) {
   };
 
   const reload = () => {
-    setPos(calib.extrinsics.pos);
-    setEul(calib.extrinsics.euler_deg);
-    stream.setCamExtrinsics(calib.extrinsics.pos, calib.extrinsics.euler_deg);
+    // Tell the server to re-read cam_calib_config.yaml. The server will
+    // broadcast a fresh KIND_CAM_CALIB; we re-seed local sliders from it.
+    seededRef.current = false;
+    stream.reloadCamExtrinsics();
   };
 
   const save = () => {

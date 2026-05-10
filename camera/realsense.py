@@ -10,6 +10,7 @@ deliver a depth stream, we log a warning and continue with color only
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,54 +44,97 @@ class RealSenseRGB:
         self._thread: threading.Thread | None = None
 
     def start(self) -> Intrinsics:
-        self._pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, self.width, self.height,
-                          rs.format.rgb8, self.fps)
-        if self._enable_depth:
-            cfg.enable_stream(rs.stream.depth, self.width, self.height,
-                              rs.format.z16, self.fps)
-        try:
-            profile = self._pipe.start(cfg)
-        except RuntimeError as exc:
-            if self._enable_depth:
-                # Fall back to color-only if depth stream wasn't accepted.
-                print(f"[cam] depth stream unavailable ({exc}); "
-                      f"falling back to color only", flush=True)
-                self._enable_depth = False
-                cfg = rs.config()
-                cfg.enable_stream(rs.stream.color, self.width, self.height,
-                                  rs.format.rgb8, self.fps)
-                profile = self._pipe.start(cfg)
-            else:
-                raise
+        # Try to open + probe the requested config. If we asked for depth
+        # but the camera fails to deliver any frames within ~1.5s, fall back
+        # to color-only. This catches the (real) D455 failure mode where
+        # pipe.start() succeeds but RGBD never delivers a frame.
+        if self._enable_depth and not self._open_and_probe(want_depth=True):
+            print("[cam] WARNING: RGBD probe got no frames; retrying as "
+                  "color-only. Camera depth backend will be unavailable.",
+                  flush=True)
+            self._enable_depth = False
+            self._open_and_probe(want_depth=False)  # raises if this also fails
 
-        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.intrinsics = Intrinsics(width=intr.width, height=intr.height,
-                                     fx=intr.fx, fy=intr.fy,
-                                     cx=intr.ppx, cy=intr.ppy)
-
-        if self._enable_depth:
-            try:
-                depth_sensor = profile.get_device().first_depth_sensor()
-                self._depth_scale = float(depth_sensor.get_depth_scale())
-                self._align = rs.align(rs.stream.color)
-                self.has_depth = True
-                print(f"[cam] depth stream enabled  "
-                      f"depth_scale={self._depth_scale:g} m/unit", flush=True)
-            except Exception as exc:
-                print(f"[cam] depth setup failed ({exc}); color only",
-                      flush=True)
-                self.has_depth = False
-                self._align = None
-
+        intr = self.intrinsics
+        if intr is None:
+            raise RuntimeError("camera failed to start")
         self._running.set()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         print(f"[cam] {intr.width}x{intr.height}  fx={intr.fx:.1f}  "
               f"fy={intr.fy:.1f}  depth={'on' if self.has_depth else 'off'}",
               flush=True)
-        return self.intrinsics
+        return intr
+
+    def _open_and_probe(self, *, want_depth: bool,
+                        probe_timeout_s: float = 1.5) -> bool:
+        """Open a fresh pipeline with the requested streams and confirm at
+        least one color frame arrives within probe_timeout_s. Returns True
+        on success. On failure (no frames), the pipeline is stopped and the
+        function returns False so the caller can retry with a different
+        config; if the open itself raises, propagates the exception.
+
+        On success, populates self.intrinsics, self._depth_scale, self._align,
+        self.has_depth and leaves self._pipe running.
+        """
+        # Always start from a clean slate.
+        if self._pipe is not None:
+            try:
+                self._pipe.stop()
+            except Exception:
+                pass
+        self._pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, self.width, self.height,
+                          rs.format.rgb8, self.fps)
+        if want_depth:
+            cfg.enable_stream(rs.stream.depth, self.width, self.height,
+                              rs.format.z16, self.fps)
+
+        profile = self._pipe.start(cfg)  # may raise RuntimeError
+
+        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.intrinsics = Intrinsics(width=intr.width, height=intr.height,
+                                     fx=intr.fx, fy=intr.fy,
+                                     cx=intr.ppx, cy=intr.ppy)
+
+        if want_depth:
+            try:
+                depth_sensor = profile.get_device().first_depth_sensor()
+                self._depth_scale = float(depth_sensor.get_depth_scale())
+                self._align = rs.align(rs.stream.color)
+                self.has_depth = True
+            except Exception as exc:
+                print(f"[cam] depth setup failed ({exc}); will fall back",
+                      flush=True)
+                self.has_depth = False
+                self._align = None
+        else:
+            self.has_depth = False
+            self._align = None
+
+        # Probe a frame within probe_timeout_s.
+        deadline = time.time() + probe_timeout_s
+        while time.time() < deadline:
+            remaining_ms = max(50, int((deadline - time.time()) * 1000))
+            try:
+                frames = self._pipe.wait_for_frames(timeout_ms=remaining_ms)
+            except RuntimeError:
+                continue
+            if frames.get_color_frame():
+                if want_depth:
+                    print(f"[cam] depth stream enabled  "
+                          f"depth_scale={self._depth_scale:g} m/unit",
+                          flush=True)
+                return True
+
+        # No frames in budget; tear down the pipeline.
+        try:
+            self._pipe.stop()
+        except Exception:
+            pass
+        self._pipe = None
+        return False
 
     def stop(self):
         self._running.clear()

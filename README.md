@@ -58,18 +58,34 @@ huggingface-cli login
 
 The token is cached in `~/.cache/huggingface/token` and used automatically.
 
-### Optional backends (UniDepth / Metric3D)
+### Optional backends (MoGe-2 / UniDepth / Metric3D)
 
 These have problematic build deps so they aren't installed by default. Add
 them only if you want those dropdown entries to work:
 
 ```bash
+# MoGe / MoGe-2 (Microsoft, NeurIPS 2025)
+uv pip install --no-build-isolation \
+  "moge @ git+https://github.com/microsoft/MoGe.git"
+
 # UniDepth V2
 uv pip install --no-build-isolation \
   "unidepth @ git+https://github.com/lpiccinelli-eth/UniDepth.git"
 
 # Metric3D V2 — pulls code via torch.hub at runtime; mmcv may also be needed
 uv pip install timm
+```
+
+### Real-robot mode (Kinova Gen3)
+
+`--robot-source hardware` needs the Kinova SDK + Pinocchio. The bundled
+wheel is for `kortex_api 2.6.0.post3`; on Python 3.13 you also need to pin
+protobuf (the wheel ships `3.5.1` in its metadata which is broken on 3.13).
+
+```bash
+uv pip install ./wheels/kortex_api-2.6.0.post3-py3-none-any.whl
+uv pip install "protobuf==3.20.0"
+# pinocchio (`pin` on PyPI) is already a runtime dep, installed by `uv sync`.
 ```
 
 ## Calibration config
@@ -108,18 +124,47 @@ uv run web_server.py --mode sim --mjcf robot/mjcf/scene.xml
 # add --mujoco-gui to also open the native passive viewer window
 ```
 
+Real-robot mode (Kinova Gen3 OSC torque loop, robot must be reachable at the
+configured IP):
+
+```bash
+uv run web_server.py --mjcf robot/mjcf/scene.xml --robot-source hardware
+# --robot-ip 192.168.1.10 by default
+```
+
 Then open <http://localhost:5173> (Vite dev) — or run `npm run build` inside
 `web/` to ship the static bundle.
 
 Flags:
 
 - `--mode {real,sim}` — `sim` swaps RealSense for a MuJoCo render of `--mjcf`.
-- `--mjcf PATH` — load an MJCF for robot display (required in `sim` mode).
-- `--robot-source {none,dummy,sim}` — `dummy` animates joints; `sim` is
-  implied by `--mode sim`.
+- `--mjcf PATH` — load an MJCF for robot display (required in `sim` mode and
+  in `--robot-source hardware`).
+- `--robot-source {none,dummy,sim,hardware}` — `dummy` animates joints;
+  `sim` is implied by `--mode sim`; `hardware` spawns the Kinova OSC loop.
+- `--robot-ip ADDR` — Kinova IP for `--robot-source hardware` (default
+  `192.168.1.10`).
+- `--robot-arm-mjcf PATH` — bare-arm MJCF for Pinocchio dynamics in hardware
+  mode (default `robot/mjcf/gen3_gripper.xml`). Pinocchio's MJCF parser
+  rejects scenes that contain world geoms (e.g. floor planes), so this must
+  be an arm-only file.
 - `--sim-camera NAME` — which MJCF camera to render in sim mode
   (default `ext_rgbd`).
 - `--mujoco-gui` — open MuJoCo's passive native viewer (sim mode only).
+
+### Shutting down (especially with `--robot-source hardware`)
+
+**Always Ctrl-C the running terminal — never `pkill -9`.**
+
+Ctrl-C → SIGINT → asyncio's `KeyboardInterrupt` → `main_async`'s
+`finally:` → `stop_hardware()` sets the OSC stop event → the OSC loop's
+own `finally:` switches the arm out of torque mode, drives it back to
+home in position-control, and disconnects.
+
+`pkill -9` skips that path. The robot is left in low-level (torque) mode
+without a command stream — the firmware watchdog freezes the joints, but
+you'll need to manually clear faults and switch back to high-level on the
+next launch. Avoid.
 
 ## Hardware
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { RobotRenderer } from "./RobotRenderer";
 import { StreamState } from "./useStream";
 
@@ -12,6 +13,10 @@ type Props = {
   showCamera: boolean;
   showBBox: boolean;
   showRobot: boolean;
+  showEeAxes: boolean;
+  showWorldAxes: boolean;
+  showWorldHandle: boolean;
+  gizmoMode: "translate" | "rotate";
 };
 
 const POINT_VS = /* glsl */ `
@@ -44,10 +49,10 @@ void main() {
   gl_FragColor = vec4(c, 1.0);
 }`;
 
-export function Viewer({ stream, pointSize, inversePerspective, display, showCamera, showBBox, showRobot }: Props) {
+export function Viewer({ stream, pointSize, inversePerspective, display, showCamera, showBBox, showRobot, showEeAxes, showWorldAxes, showWorldHandle, gizmoMode }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera, showBBox, showRobot });
-  propsRef.current = { pointSize, inversePerspective, display, showCamera, showBBox, showRobot };
+  const propsRef = useRef({ pointSize, inversePerspective, display, showCamera, showBBox, showRobot, showEeAxes, showWorldAxes, showWorldHandle, gizmoMode });
+  propsRef.current = { pointSize, inversePerspective, display, showCamera, showBBox, showRobot, showEeAxes, showWorldAxes, showWorldHandle, gizmoMode };
   // Mirror `stream` into a ref so the (mount-only) effect always sees the
   // latest meta + state objects, not the ones captured at mount.
   const streamRef = useRef(stream);
@@ -74,9 +79,10 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     controls.dampingFactor = 0.1;
     controls.update();
 
-    // World axes at origin
-    const axes = new THREE.AxesHelper(0.15);
-    scene.add(axes);
+    // World axes at origin (X red, Y green, Z blue).
+    const worldAxes = new THREE.AxesHelper(0.20);
+    worldAxes.name = "world-axes";
+    scene.add(worldAxes);
 
     // Lights for the MJCF robot (MeshLambertMaterial). Other point/mesh
     // surfaces use ShaderMaterials and are unaffected.
@@ -289,6 +295,155 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     renderer.domElement.addEventListener("mousedown", onCanvasMouseDown);
     renderer.domElement.addEventListener("click", onCanvasClick);
 
+    // ── Camera-pose gizmos ──────────────────────────────────────────────
+    // Two TransformControls attached to cameraPose so translate arrows and
+    // rotate rings are visible at the same time. Sized differently so the
+    // rings sit outside the arrows and don't fight for clicks.
+    // Two TransformControls (translate + rotate) attached to cameraPose.
+    // Shown one at a time based on gizmoMode — they overlap badly when both
+    // are visible (rings steal hits from arrows). Same UX as Viser when you
+    // disable_sliders or disable_rotations.
+    const gizmoT = new TransformControls(camera, renderer.domElement);
+    gizmoT.setMode("translate");
+    gizmoT.setSpace("local");
+    gizmoT.size = 1.0;
+    gizmoT.attach(cameraPose);
+    const gizmoR = new TransformControls(camera, renderer.domElement);
+    gizmoR.setMode("rotate");
+    gizmoR.setSpace("local");
+    gizmoR.size = 1.0;
+    gizmoR.attach(cameraPose);
+    const gizmoTHelper = gizmoT.getHelper();
+    const gizmoRHelper = gizmoR.getHelper();
+    scene.add(gizmoTHelper);
+    scene.add(gizmoRHelper);
+
+    let suppressEcho = false;   // ignore server echo while we're dragging
+    const onDraggingChanged = (ev: { value: unknown }) => {
+      const dragging = !!ev.value;
+      controls.enabled = !dragging;
+      if (dragging) {
+        suppressEcho = true;
+      } else {
+        // Wait one server round-trip before re-accepting echoes so the
+        // local gizmo position doesn't fight the echo.
+        setTimeout(() => { suppressEcho = false; }, 250);
+      }
+    };
+    gizmoT.addEventListener("dragging-changed", onDraggingChanged);
+    gizmoR.addEventListener("dragging-changed", onDraggingChanged);
+
+    // Throttled sender so dragging doesn't spam the WS at 60 Hz.
+    let lastSent = 0;
+    const SEND_PERIOD_MS = 33;        // ~30 Hz
+    const sendCalibFromGizmo = () => {
+      const now = performance.now();
+      if (now - lastSent < SEND_PERIOD_MS) return;
+      lastSent = now;
+      const pos: [number, number, number] = [
+        cameraPose.position.x, cameraPose.position.y, cameraPose.position.z,
+      ];
+      // Three.js Quaternion -> intrinsic XYZ Euler (degrees), matching the
+      // server-side convention in config._euler_xyz_deg_to_matrix
+      // (R = Rx @ Ry @ Rz).
+      const e = new THREE.Euler().setFromQuaternion(cameraPose.quaternion, "XYZ");
+      const eul: [number, number, number] = [
+        THREE.MathUtils.radToDeg(e.x),
+        THREE.MathUtils.radToDeg(e.y),
+        THREE.MathUtils.radToDeg(e.z),
+      ];
+      streamRef.current.setCamExtrinsics(pos, eul);
+    };
+    gizmoT.addEventListener("objectChange", sendCalibFromGizmo);
+    gizmoR.addEventListener("objectChange", sendCalibFromGizmo);
+
+    // ── World-frame handle gizmo ────────────────────────────────────────
+    // Drag the world-origin handle to nudge T_world_camera *inversely* —
+    // i.e. moving the world +X by Δ is equivalent to moving the camera −Δ
+    // in world. Useful when you want to align the robot mesh under the
+    // point cloud rather than the other way around.
+    //
+    // Implementation: keep a separate "worldHandle" Object3D at world
+    // identity. On drag-start we snapshot the camera pose. On every
+    // objectChange we read the handle's pose, compute T_camera_new =
+    // T_handle.inverse() · T_camera_start, and send. On drag-end we
+    // snap the handle back to identity so the next grab starts fresh.
+    const worldHandle = new THREE.Group();
+    worldHandle.name = "world-handle";
+    scene.add(worldHandle);
+    const worldGizmoT = new TransformControls(camera, renderer.domElement);
+    worldGizmoT.setMode("translate");
+    worldGizmoT.setSpace("world");   // operate in world frame, naturally
+    worldGizmoT.size = 1.0;
+    worldGizmoT.attach(worldHandle);
+    const worldGizmoR = new TransformControls(camera, renderer.domElement);
+    worldGizmoR.setMode("rotate");
+    worldGizmoR.setSpace("world");
+    worldGizmoR.size = 1.0;
+    worldGizmoR.attach(worldHandle);
+    const worldGizmoTHelper = worldGizmoT.getHelper();
+    const worldGizmoRHelper = worldGizmoR.getHelper();
+    scene.add(worldGizmoTHelper);
+    scene.add(worldGizmoRHelper);
+
+    // Camera pose at the moment of drag-start (frozen reference).
+    const camPosStart = new THREE.Vector3();
+    const camQuatStart = new THREE.Quaternion();
+
+    const onWorldDraggingChanged = (ev: { value: unknown }) => {
+      const dragging = !!ev.value;
+      controls.enabled = !dragging;
+      if (dragging) {
+        suppressEcho = true;
+        // Snapshot camera pose; reset handle so deltas are absolute.
+        camPosStart.copy(cameraPose.position);
+        camQuatStart.copy(cameraPose.quaternion);
+        worldHandle.position.set(0, 0, 0);
+        worldHandle.quaternion.identity();
+      } else {
+        // Snap handle back to identity for next grab.
+        worldHandle.position.set(0, 0, 0);
+        worldHandle.quaternion.identity();
+        setTimeout(() => { suppressEcho = false; }, 250);
+      }
+    };
+    worldGizmoT.addEventListener("dragging-changed", onWorldDraggingChanged);
+    worldGizmoR.addEventListener("dragging-changed", onWorldDraggingChanged);
+
+    // Reusable scratch objects to avoid GC.
+    const handleQuatInv = new THREE.Quaternion();
+    const camPosNew = new THREE.Vector3();
+    const camQuatNew = new THREE.Quaternion();
+
+    const sendCalibFromWorldGizmo = () => {
+      const now = performance.now();
+      if (now - lastSent < SEND_PERIOD_MS) return;
+      lastSent = now;
+      // Compute T_camera_new = T_handle.inverse() · T_camera_start.
+      // Position: subtract handle position from camera-start, then rotate
+      // back into world by handle's inverse quaternion.
+      handleQuatInv.copy(worldHandle.quaternion).invert();
+      camPosNew.copy(camPosStart)
+               .sub(worldHandle.position)
+               .applyQuaternion(handleQuatInv);
+      camQuatNew.copy(handleQuatInv).multiply(camQuatStart);
+      // Update local cameraPose immediately so the user sees the result;
+      // server echo is suppressed during drag so this won't fight.
+      cameraPose.position.copy(camPosNew);
+      cameraPose.quaternion.copy(camQuatNew);
+      const e = new THREE.Euler().setFromQuaternion(camQuatNew, "XYZ");
+      streamRef.current.setCamExtrinsics(
+        [camPosNew.x, camPosNew.y, camPosNew.z],
+        [
+          THREE.MathUtils.radToDeg(e.x),
+          THREE.MathUtils.radToDeg(e.y),
+          THREE.MathUtils.radToDeg(e.z),
+        ],
+      );
+    };
+    worldGizmoT.addEventListener("objectChange", sendCalibFromWorldGizmo);
+    worldGizmoR.addEventListener("objectChange", sendCalibFromWorldGizmo);
+
     // Resize
     const onResize = () => {
       const w = container.clientWidth, h = container.clientHeight;
@@ -326,8 +481,10 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
 
       // Apply T_world_camera to the cameraPose group whenever calibration
       // changes (live updates flow via KIND_CAM_CALIB into camCalibRef).
+      // Skip while we're dragging the gizmo: our own writes already update
+      // cameraPose, and overwriting from the server echo would fight the drag.
       const cc0 = streamRef.current.camCalibRef.current;
-      if (cc0) {
+      if (cc0 && !suppressEcho) {
         const cc = cc0.extrinsics;
         const key = `${cc.pos_world.join(",")}|${cc.quat_wxyz.join(",")}`;
         if (key !== lastCalibKey) {
@@ -344,8 +501,22 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       const p = propsRef.current;
       points.visible = p.display === "points" || p.display === "both";
       mesh.visible = p.display === "mesh" || p.display === "both";
-      axes.visible = p.showCamera;          // world axes at origin
+      worldAxes.visible = p.showWorldAxes;   // RGB axes at world origin
       cameraPose.visible = p.showCamera;     // camera body (frustum + cam-local axes)
+      // Gizmos follow cameraPose's visibility, with mode picking which one.
+      const tOn = p.showCamera && p.gizmoMode === "translate";
+      const rOn = p.showCamera && p.gizmoMode === "rotate";
+      gizmoTHelper.visible = tOn;
+      gizmoRHelper.visible = rOn;
+      gizmoT.enabled = tOn;
+      gizmoR.enabled = rOn;
+      // World handle gizmo (independent visibility, same mode).
+      const wtOn = p.showWorldHandle && p.gizmoMode === "translate";
+      const wrOn = p.showWorldHandle && p.gizmoMode === "rotate";
+      worldGizmoTHelper.visible = wtOn;
+      worldGizmoRHelper.visible = wrOn;
+      worldGizmoT.enabled = wtOn;
+      worldGizmoR.enabled = wrOn;
       uniforms.uBaseSize.value = p.pointSize;
       uniforms.uInversePerspective.value = p.inversePerspective ? 1.0 : 0.0;
 
@@ -405,7 +576,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       const rg = streamRef.current.robotGeomRef.current;
       if (rg && rg.seq !== lastRobotGeomSeq) {
         lastRobotGeomSeq = rg.seq;
-        robot.setGeometry(rg.bodies, rg.meshes, rg.geoms, rg.blob);
+        const eeIdx = streamRef.current.meta?.robot?.ee_body_idx ?? -1;
+        robot.setGeometry(rg.bodies, rg.meshes, rg.geoms, rg.blob, eeIdx);
       }
       const rx = streamRef.current.robotXformRef.current;
       if (rx && rx.seq !== lastRobotXformSeq) {
@@ -413,6 +585,7 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         robot.setTransforms(rx.xpos, rx.xquat, rx.nbody);
       }
       robot.setVisible(propsRef.current.showRobot);
+      robot.setEeAxesVisible(propsRef.current.showEeAxes);
 
       // Animate the click-feedback ping (grow + fade over 400ms).
       if (ping.visible) {
@@ -438,6 +611,17 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       window.removeEventListener("resize", onResize);
       renderer.domElement.removeEventListener("mousedown", onCanvasMouseDown);
       renderer.domElement.removeEventListener("click", onCanvasClick);
+      // Detach + remove helpers. Skip TransformControls.dispose() — in
+      // three r169 it calls this.traverse() but TransformControls extends
+      // Controls (not Object3D), so it throws.
+      for (const g of [gizmoT, gizmoR, worldGizmoT, worldGizmoR]) g.detach();
+      for (const h of [gizmoTHelper, gizmoRHelper, worldGizmoTHelper, worldGizmoRHelper]) {
+        scene.remove(h);
+        if (typeof (h as { dispose?: () => void }).dispose === "function") {
+          (h as { dispose: () => void }).dispose();
+        }
+      }
+      scene.remove(worldHandle);
       controls.dispose();
       renderer.dispose();
       pointsMat.dispose();

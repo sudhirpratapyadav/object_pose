@@ -26,3 +26,6 @@ datasets/
 cam_calib_config.yaml
 sim_config.yaml
 cam_factory_intrinsics.yaml
+
+# Diagnostic dumps from test/ scripts.
+test/_realsense_dump/

@@ -54,6 +54,7 @@ from wire import (
     encode_model_state,
     encode_points,
     encode_robot_geometry,
+    encode_robot_status,
     encode_robot_transforms,
     encode_sam_state,
     encode_stats,
@@ -158,6 +159,7 @@ async def handler(ws, hub: Hub, get_connect_frames,
                   on_sam_click, on_sam_clear,
                   on_set_source,
                   on_set_cam_extrinsics, on_save_cam_extrinsics,
+                  on_reload_cam_extrinsics,
                   on_set_target_ctrl) -> None:
     await hub.add(ws)
     try:
@@ -196,6 +198,8 @@ async def handler(ws, hub: Hub, get_connect_frames,
                         )
                 elif "save_cam_extrinsics" in cmd:
                     await on_save_cam_extrinsics()
+                elif "reload_cam_extrinsics" in cmd:
+                    await on_reload_cam_extrinsics()
                 elif "set_target_ctrl" in cmd and isinstance(cmd["set_target_ctrl"], list):
                     vals = [float(x) for x in cmd["set_target_ctrl"]]
                     await on_set_target_ctrl(vals)
@@ -215,6 +219,8 @@ def _make_camera(kind: str, video_name: str | None, args, cam_calib: CamCalib):
         return VideoFile(str(path)), False
     if args.camera == "realsense":
         # Honour YAML resolution; intrinsics get overridden after start().
+        # enable_depth=True; RealSenseRGB will auto-fall-back to color-only
+        # if the camera fails to deliver any frames in RGBD mode.
         cam = RealSenseRGB(
             width=cam_calib.intrinsics.width,
             height=cam_calib.intrinsics.height,
@@ -406,6 +412,12 @@ async def main_async(args) -> None:
                         for a in robot["scene"].actuators
                     ] if robot["enabled"] and robot["scene"] is not None else []
                 ),
+                "ee_body_idx":  (robot["scene"].ee_body_idx
+                                 if robot["enabled"] and robot["scene"] is not None
+                                 else -1),
+                "ee_body_name": (robot["scene"].ee_body_name
+                                 if robot["enabled"] and robot["scene"] is not None
+                                 else ""),
             },
             "cam_calib": _calib_payload(sess["calib"]),
         }
@@ -643,6 +655,29 @@ async def main_async(args) -> None:
         except Exception as exc:
             print(f"[cfg] save failed: {exc}", flush=True)
 
+    async def on_reload_cam_extrinsics() -> None:
+        """Re-read cam_calib_config.yaml from disk and broadcast it.
+
+        Discards in-memory edits — useful when the user tweaked the gizmo
+        and wants to revert to the saved version. Intrinsics are not
+        touched (we never change them at runtime).
+        """
+        try:
+            fresh = await asyncio.to_thread(load_cam_calib, CAM_CALIB_PATH)
+        except Exception as exc:
+            print(f"[cfg] reload failed: {exc}", flush=True)
+            return
+        # Replace extrinsics; keep intrinsics from the live session (which
+        # for real-camera mode were possibly overridden by factory at boot).
+        sess["calib"] = CamCalib(
+            extrinsics=fresh.extrinsics,
+            intrinsics=sess["calib"].intrinsics,
+        )
+        print(f"[cfg] reloaded {CAM_CALIB_PATH.name}: "
+              f"pos={sess['calib'].extrinsics.pos} "
+              f"euler={sess['calib'].extrinsics.euler_deg}", flush=True)
+        await hub.broadcast(encode_cam_calib(0, _calib_payload(sess["calib"])))
+
     async def on_set_target_ctrl(vals: list[float]) -> None:
         """Browser slider -> sim worker. No-op when no robot loaded."""
         nu = robot["nu"]
@@ -731,6 +766,113 @@ async def main_async(args) -> None:
             if sim["proc"].is_alive():
                 sim["proc"].terminate()
 
+    # ---- Hardware worker (--robot-source hardware) -----------------------
+    hw_state: dict = {
+        "proc": None,
+        "stop_ev": None,
+        "reset_ev": None,
+        "reset_done_ev": None,
+        "shm_target": None,
+        "shm_gains": None,
+        "shm_hz": None,
+        "shm_gripper": None,
+        "hz": 0.0,
+    }
+
+    if args.robot_source == "hardware":
+        from hardware import (
+            real_robot_process, PinocchioArm, kinova_deg_to_rad,
+            HOME_DEG, GAINS_KEYS,
+        )
+
+        # Read-only seed: compute home EE pose and write into shm_target so
+        # the OSC loop tracks itself at home (no motion until/unless someone
+        # writes a new target).
+        try:
+            arm_init = PinocchioArm(args.robot_arm_mjcf, ee_frame="pinch_site")
+        except Exception as exc:
+            print(f"[hw] failed to load arm MJCF '{args.robot_arm_mjcf}': "
+                  f"{exc}", flush=True)
+            return
+        home_q = kinova_deg_to_rad(HOME_DEG)
+        home_pos, home_rot = arm_init.fk(home_q)
+        # Pinocchio uses XYZW quat convention; build it from rotation matrix
+        # via SciPy-equivalent path. We just need a valid xyzw: convert via
+        # our own helper.
+        wxyz = matrix_to_quat_wxyz(home_rot)
+        # OSC expects target = [pos(3), quat_xyzw(4)]
+        target_init = np.zeros(7, dtype=np.float64)
+        target_init[:3] = home_pos
+        target_init[3:6] = wxyz[1:4]    # x, y, z
+        target_init[6]   = wxyz[0]      # w
+        del arm_init  # free pinocchio resources held in this process
+
+        # Conservative defaults — same as cam_calib_old.
+        gains_init = np.array([5.0, 0.0, 1.0, 0.0, 10.0, 2.0, 0.0],
+                              dtype=np.float64)
+        assert len(gains_init) == len(GAINS_KEYS)
+
+        shm_target  = mp.Array("d", target_init, lock=True)
+        shm_gains   = mp.Array("d", gains_init, lock=True)
+        # lock=True so .get_obj() works for np.frombuffer in stream_loop.
+        shm_hz      = mp.Array("d", 1, lock=True)
+        shm_gripper = mp.Array("d", 1, lock=True)
+        hw_stop_ev      = mp.Event()
+        hw_reset_ev     = mp.Event()
+        hw_reset_done   = mp.Event()
+        hw_state.update(
+            stop_ev=hw_stop_ev, reset_ev=hw_reset_ev, reset_done_ev=hw_reset_done,
+            shm_target=shm_target, shm_gains=shm_gains,
+            shm_hz=shm_hz, shm_gripper=shm_gripper,
+        )
+
+        # Reuse the existing robot.shm.qpos slot so the OSC loop's joint-angle
+        # output flows through the same FK + transform broadcast as sim/dummy.
+        # OSC writes 7-DOF arm (rad); the rest of robot.shm.nq is zero/unused
+        # for the FK display (gripper joints stay at 0 until we wire grippers).
+        # If nq != 7 we need a tiny adapter: write into the first 7 slots.
+        if robot["shm"].nq < 7:
+            print(f"[hw] robot shm has nq={robot['shm'].nq}, expected >=7",
+                  flush=True)
+            return
+
+        # The OSC loop expects shm_q to be 7-long. We have a 15-DOF qpos shm
+        # (arm + gripper joints) — slice it. Easiest: pass a separate small
+        # 7-DOF shm and copy into the main qpos slot in stream_loop.
+        shm_q_arm = mp.Array("d", 7, lock=True)
+        hw_state["shm_q_arm"] = shm_q_arm
+
+        hw_proc = mp.Process(
+            target=real_robot_process,
+            args=(args.robot_ip, args.robot_arm_mjcf,
+                  shm_q_arm, shm_target, shm_gains, shm_hz, shm_gripper,
+                  hw_stop_ev, hw_reset_ev, hw_reset_done),
+            kwargs={"ee_frame": "pinch_site"},
+            daemon=True,
+        )
+        hw_proc.start()
+        hw_state["proc"] = hw_proc
+        print(f"[hw] OSC process started (ip={args.robot_ip}, "
+              f"mjcf={args.robot_arm_mjcf})", flush=True)
+
+    def stop_hardware() -> None:
+        if hw_state["stop_ev"] is not None:
+            hw_state["stop_ev"].set()
+        if hw_state["proc"] is not None:
+            # The OSC subprocess's finally: drives back to home in position
+            # mode (torque-off → high-level → clear-faults → JointMove home →
+            # disconnect). That can take ~15 s; give it 30 before forcing.
+            print("[hw] waiting for OSC subprocess to park the arm…",
+                  flush=True)
+            hw_state["proc"].join(timeout=30.0)
+            if hw_state["proc"].is_alive():
+                print("[hw] OSC subprocess didn't exit cleanly; terminating",
+                      flush=True)
+                hw_state["proc"].terminate()
+                hw_state["proc"].join(timeout=2.0)
+            else:
+                print("[hw] OSC subprocess parked.", flush=True)
+
     async def ws_loop():
         def get_connect_frames() -> list[bytes]:
             meta = encode_meta(0, {
@@ -749,6 +891,7 @@ async def main_async(args) -> None:
                 on_sam_click, on_sam_clear,
                 on_set_source,
                 on_set_cam_extrinsics, on_save_cam_extrinsics,
+                on_reload_cam_extrinsics,
                 on_set_target_ctrl,
             ),
             args.host, args.port,
@@ -936,6 +1079,21 @@ async def main_async(args) -> None:
                 )
                 seq += 1
 
+            # Hardware mode: copy the OSC's 7-DOF arm angles (rad) into the
+            # main qpos slot and bump qpos_seq so the FK + transforms branch
+            # below picks them up, same as sim/dummy.
+            if (args.robot_source == "hardware"
+                    and hw_state.get("shm_q_arm") is not None
+                    and robot["shm"] is not None):
+                with hw_state["shm_q_arm"].get_lock():
+                    arm_q = np.frombuffer(hw_state["shm_q_arm"].get_obj(),
+                                          dtype=np.float64).copy()
+                # Don't write a frame of zeros (OSC hasn't reported yet).
+                if np.any(arm_q):
+                    cur_qpos = robot["shm"].read_qpos()
+                    cur_qpos[:7] = arm_q
+                    robot["shm"].write_qpos(cur_qpos)
+
             # Robot transforms — broadcast whenever qpos_seq advances.
             if robot["enabled"] and robot["shm"] is not None:
                 cur_q = robot["shm"].read_seq()
@@ -958,6 +1116,21 @@ async def main_async(args) -> None:
                     "sam_ms":    sam_last_ms["v"],
                 }))
                 seq += 1
+                # Hardware mode: broadcast OSC rate.
+                if args.robot_source == "hardware" and hw_state["shm_hz"] is not None:
+                    try:
+                        osc_hz = float(np.frombuffer(hw_state["shm_hz"].get_obj(),
+                                                     dtype=np.float64)[0])
+                    except (AttributeError, ValueError):
+                        osc_hz = 0.0
+                    proc_alive = bool(hw_state["proc"] is not None
+                                      and hw_state["proc"].is_alive())
+                    await hub.broadcast(encode_robot_status(seq, {
+                        "source": "hardware",
+                        "osc_hz": round(osc_hz, 1),
+                        "alive":  proc_alive,
+                    }))
+                    seq += 1
                 n_rgb = n_depth = 0
                 t_log = time.time()
 
@@ -973,6 +1146,7 @@ async def main_async(args) -> None:
         if robot["src"] is not None:
             robot["src"].stop()
         stop_sim()
+        stop_hardware()
         stop_seg()
         stop_depth()
         teardown_session()
@@ -994,11 +1168,20 @@ def main() -> None:
                     help="Path to an MJCF scene to display a robot. "
                          "If omitted, no robot is rendered.")
     ap.add_argument("--robot-source", default="none",
-                    choices=["none", "dummy", "sim"],
+                    choices=["none", "dummy", "sim", "hardware"],
                     dest="robot_source",
                     help="Where qpos comes from. 'none' = stays at home. "
                          "'dummy' = sine animation (test only). 'sim' = MuJoCo "
-                         "physics process; implied by --mode sim.")
+                         "physics process; implied by --mode sim. "
+                         "'hardware' = real Kinova OSC loop (--mode real only).")
+    ap.add_argument("--robot-ip", default="192.168.1.10", dest="robot_ip",
+                    help="Kinova hardware IP (for --robot-source hardware).")
+    ap.add_argument("--robot-arm-mjcf", default="robot/mjcf/gen3_gripper.xml",
+                    dest="robot_arm_mjcf",
+                    help="Bare-arm MJCF for Pinocchio dynamics in hardware "
+                         "mode. Pinocchio chokes on full scene MJCFs that "
+                         "include world geoms (e.g. floor planes), so this "
+                         "must be an arm-only file.")
     ap.add_argument("--mode", default="real", choices=["real", "sim"],
                     help="'real' uses a physical camera (RealSense or HTTP). "
                          "'sim' replaces the camera with a MuJoCo render of "
@@ -1015,8 +1198,12 @@ def main() -> None:
     if args.mode == "sim":
         if not args.mjcf:
             ap.error("--mode sim requires --mjcf")
+        if args.robot_source == "hardware":
+            ap.error("--robot-source hardware is not supported with --mode sim")
         # Sim mode is its own qpos producer.
         args.robot_source = "sim"
+    if args.robot_source == "hardware" and args.mode != "real":
+        ap.error("--robot-source hardware requires --mode real")
     if args.mujoco_gui and args.mode != "sim":
         ap.error("--mujoco-gui requires --mode sim")
     try:

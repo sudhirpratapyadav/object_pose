@@ -52,7 +52,7 @@ def _moge(key: str, repo: str, label: str,
         repo=repo, infer_w=infer_w, infer_h=infer_h,
         has_normals=has_normals,
     )
-    return lambda focal_px: MoGeBackend(info, WEIGHTS_ROOT)
+    return lambda focal_px: MoGeBackend(info, WEIGHTS_ROOT, focal_px=focal_px)
 
 
 # Sentinel factory: the camera-depth backend is built by depth_worker via

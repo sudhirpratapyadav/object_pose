@@ -3,10 +3,10 @@ import {
   CamCalibPayload,
   Frame, KIND_CAM_CALIB, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH,
   KIND_META, KIND_MODEL_STATE, KIND_NORMAL_JPEG, KIND_POINTS,
-  KIND_ROBOT_GEOMETRY, KIND_ROBOT_TRANSFORMS,
+  KIND_ROBOT_GEOMETRY, KIND_ROBOT_STATUS, KIND_ROBOT_TRANSFORMS,
   KIND_SAM_STATE, KIND_STATS,
   Meta, ModelState, RobotBody, RobotGeom, RobotMeshIndex,
-  SamState, Stats, parseFrame,
+  RobotStatus, SamState, Stats, parseFrame,
 } from "./protocol";
 
 type JpegRef = React.MutableRefObject<{ blobUrl: string | null; seq: number }>;
@@ -40,6 +40,7 @@ export type StreamState = {
   samState: SamState | null;
   stats: Stats | null;
   camCalib: CamCalibPayload | null;
+  robotStatus: RobotStatus | null;
   pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
   meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; normal: Float32Array | null; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
@@ -59,6 +60,7 @@ export type StreamState = {
   setCamExtrinsics: (pos: [number, number, number],
                      euler_deg: [number, number, number]) => void;
   saveCamExtrinsics: () => void;
+  reloadCamExtrinsics: () => void;
   setTargetCtrl: (vals: number[]) => void;
 };
 
@@ -68,6 +70,7 @@ export function useStream(url: string): StreamState {
   const [samState, setSamState] = useState<SamState | null>(null);
   const [stats, setStats] = useState<Stats | null>(null);
   const [camCalib, setCamCalib] = useState<CamCalibPayload | null>(null);
+  const [robotStatus, setRobotStatus] = useState<RobotStatus | null>(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const camCalibRef = useRef<CamCalibPayload | null>(null);
@@ -123,6 +126,9 @@ export function useStream(url: string): StreamState {
           case KIND_CAM_CALIB:
             setCamCalib(frame.calib);
             camCalibRef.current = frame.calib;
+            break;
+          case KIND_ROBOT_STATUS:
+            setRobotStatus(frame.status);
             break;
           case KIND_MODEL_STATE:
             setModelState(frame.state);
@@ -222,16 +228,20 @@ export function useStream(url: string): StreamState {
     () => send({ save_cam_extrinsics: true }),
     [],
   );
+  const reloadCamExtrinsics = useCallback(
+    () => send({ reload_cam_extrinsics: true }),
+    [],
+  );
   const setTargetCtrl = useCallback(
     (vals: number[]) => send({ set_target_ctrl: vals }),
     [],
   );
 
   return {
-    meta, modelState, samState, stats, camCalib,
+    meta, modelState, samState, stats, camCalib, robotStatus,
     pointsRef, meshRef, jpegRef, depthJpegRef, normalJpegRef, maskRef,
     robotGeomRef, robotXformRef, camCalibRef,
     connected, setModel, setSamModel, samClick, samClear, setSource,
-    setCamExtrinsics, saveCamExtrinsics, setTargetCtrl,
+    setCamExtrinsics, saveCamExtrinsics, reloadCamExtrinsics, setTargetCtrl,
   };
 }

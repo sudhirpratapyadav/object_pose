@@ -147,22 +147,38 @@ def real_robot_process(ip, mjcf_path, shm_q, shm_target, shm_gains, shm_hz,
     shm_gains, gripper [0..1] from shm_gripper. Updates shm_hz with measured
     rate. Honors stop_ev / reset_ev / reset_done_ev for lifecycle control.
     """
+    # Basic logging so kortex / KinovaHardware messages aren't swallowed.
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="[real:%(levelname)s] %(message)s",
+                        force=True)
+
     inner_dt = 1.0 / OSC_HZ
     robot    = PinocchioArm(str(mjcf_path), ee_frame=ee_frame)
     posture  = kinova_deg_to_rad(HOME_DEG)
 
     hw = KinovaHardware(ip)
     try:
-        print("[real] Connecting…")
+        print("[real] Connecting…", flush=True)
         hw.connect()
         hw.clear_faults()
         if not hw.wait_until_ready():
-            print("[real] Not ready — aborting")
+            print("[real] Not ready — aborting", flush=True)
             return
 
         hw.set_servoing_mode(low_level=False)
-        print("[real] Going to home…")
-        hw.go_to_joints(HOME_DEG)
+        # Settle in high-level mode before issuing the motion. Some firmware
+        # versions abort the first JointMove if it's issued too soon after a
+        # low-level → high-level transition.
+        time.sleep(1.0)
+        hw.clear_faults()
+        if not hw.wait_until_ready(timeout=5.0):
+            print("[real] Not ready after clear_faults — aborting", flush=True)
+            return
+        print("[real] Going to home…", flush=True)
+        if not hw.go_to_joints(HOME_DEG):
+            print("[real] go_to_joints failed — aborting", flush=True)
+            return
         time.sleep(1.0)
         hw.set_servoing_mode(low_level=True)
         time.sleep(0.5)
@@ -176,7 +192,7 @@ def real_robot_process(ip, mjcf_path, shm_q, shm_target, shm_gains, shm_hz,
         while not stop_ev.is_set():
             if reset_ev.is_set():
                 reset_ev.clear()
-                print("[real] Reset: going home…")
+                print("[real] Reset: going home…", flush=True)
                 hw.set_torque_mode(False)
                 hw.set_servoing_mode(low_level=False)
                 hw.go_to_joints(HOME_DEG)
@@ -229,6 +245,6 @@ def real_robot_process(ip, mjcf_path, shm_q, shm_target, shm_gains, shm_hz,
             if hw.wait_until_ready(timeout=5.0):
                 hw.go_to_joints(HOME_DEG)
         except Exception as exc:
-            print(f"[real] Shutdown warning: {exc}")
+            print(f"[real] Shutdown warning: {exc}", flush=True)
         hw.disconnect()
-        print("[real] Done.")
+        print("[real] Done.", flush=True)

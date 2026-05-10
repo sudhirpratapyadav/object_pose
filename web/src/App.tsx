@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { CamCalibPanel } from "./CamCalibPanel";
+import { HardwareStatusPanel } from "./HardwareStatusPanel";
 import { JointTargetsPanel } from "./JointTargetsPanel";
 import { Viewer } from "./Viewer";
 import { StreamState, useStream } from "./useStream";
@@ -15,17 +16,23 @@ export default function App() {
   const [showCamera, setShowCamera] = useState(false);
   const [showBBox, setShowBBox] = useState(false);
   const [showRobot, setShowRobot] = useState(true);
+  const [showEeAxes, setShowEeAxes] = useState(true);
+  const [showWorldAxes, setShowWorldAxes] = useState(false);
+  const [showWorldHandle, setShowWorldHandle] = useState(false);
+  const [gizmoMode, setGizmoMode] = useState<"translate" | "rotate">("translate");
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [depthUrl, setDepthUrl] = useState<string | null>(null);
   const [normalUrl, setNormalUrl] = useState<string | null>(null);
   const [hideHud, setHideHud] = useState(false);
 
-  // Press H to toggle HUD panels (status pills stay).
+  // Keyboard shortcuts: H toggles HUD, T/R switch the camera-pose gizmo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT")) return;
       if (e.key === "h" || e.key === "H") setHideHud((v) => !v);
+      else if (e.key === "t" || e.key === "T") setGizmoMode("translate");
+      else if (e.key === "r" || e.key === "R") setGizmoMode("rotate");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -83,6 +90,10 @@ export default function App() {
           showCamera={showCamera}
           showBBox={showBBox}
           showRobot={showRobot}
+          showEeAxes={showEeAxes}
+          showWorldAxes={showWorldAxes}
+          showWorldHandle={showWorldHandle}
+          gizmoMode={gizmoMode}
         />
       </div>
 
@@ -203,12 +214,51 @@ export default function App() {
           <label className="toggle">
             <input
               type="checkbox"
+              checked={showWorldAxes}
+              onChange={(e) => setShowWorldAxes(e.target.checked)}
+            />
+            World axes
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={showWorldHandle}
+              onChange={(e) => setShowWorldHandle(e.target.checked)}
+            />
+            World handle
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
               checked={showBBox}
               onChange={(e) => setShowBBox(e.target.checked)}
             />
             Show 3D bounding box
           </label>
         </div>
+
+        {showCamera && (
+          <div className="row">
+            <div className="label">Gizmo</div>
+            <div className="segmented">
+              <button
+                className={gizmoMode === "translate" ? "active" : ""}
+                onClick={() => setGizmoMode("translate")}
+                title="Drag colored arrows to translate (T)"
+              >
+                Translate
+              </button>
+              <button
+                className={gizmoMode === "rotate" ? "active" : ""}
+                onClick={() => setGizmoMode("rotate")}
+                title="Drag colored rings to rotate (R)"
+              >
+                Rotate
+              </button>
+            </div>
+          </div>
+        )}
+
 
         {stream.meta?.robot?.enabled && (
           <div className="row">
@@ -220,6 +270,14 @@ export default function App() {
               />
               Show robot
             </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showEeAxes}
+                onChange={(e) => setShowEeAxes(e.target.checked)}
+              />
+              Show EE axes
+            </label>
             <span style={{ opacity: 0.6, fontSize: "0.85em", marginLeft: 8 }}>
               {stream.meta.robot.source}
             </span>
@@ -229,6 +287,8 @@ export default function App() {
         <CamCalibPanel stream={stream} />
 
         <JointTargetsPanel stream={stream} />
+
+        <HardwareStatusPanel stream={stream} />
 
         <div className="row">
           <div className="label">SAM2 model</div>

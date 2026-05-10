@@ -230,7 +230,15 @@ class KinovaHardware:
                 elif arm_state.active_state == Base_pb2.ARMSTATE_SERVOING_MANUALLY_CONTROLLED:
                     logger.warning("Arm manually controlled, stopping...")
                     self.stop()
-                elif arm_state.active_state == Base_pb2.ARMSTATE_SERVOING_PRE_READY:
+                elif arm_state.active_state == Base_pb2.ARMSTATE_SERVOING_LOW_LEVEL:
+                    logger.warning("Arm in LOW_LEVEL servoing — switching back "
+                                   "to SINGLE_LEVEL")
+                    try:
+                        self.set_servoing_mode(low_level=False)
+                    except Exception as e2:
+                        logger.warning(f"  set_servoing_mode failed: {e2}")
+                elif (hasattr(Base_pb2, "ARMSTATE_SERVOING_PRE_READY")
+                      and arm_state.active_state == Base_pb2.ARMSTATE_SERVOING_PRE_READY):
                     logger.info("Arm in PRE_READY, clearing faults…")
                     self.clear_faults()
             except Exception as e:

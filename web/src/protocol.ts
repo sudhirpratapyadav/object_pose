@@ -20,6 +20,7 @@ export const KIND_NORMAL_JPEG = 9;
 export const KIND_ROBOT_GEOMETRY = 10;
 export const KIND_ROBOT_TRANSFORMS = 11;
 export const KIND_CAM_CALIB = 12;
+export const KIND_ROBOT_STATUS = 13;
 
 // MuJoCo geom type codes (mjtGeom).
 export const GEOM_PLANE     = 0;
@@ -84,6 +85,8 @@ export type Meta = {
   robot?: {
     enabled: boolean; source: string; mjcf: string | null;
     actuators: { name: string; min: number; max: number; home: number }[];
+    ee_body_idx: number;
+    ee_body_name: string;
   };
   cam_calib?: CamCalibPayload;
 };
@@ -121,6 +124,17 @@ export type RobotTransformsFrame = {
 export type CamCalibFrame = {
   kind: typeof KIND_CAM_CALIB; seq: number;
   calib: CamCalibPayload;
+};
+
+export type RobotStatus = {
+  source: string;
+  osc_hz?: number;
+  alive?: boolean;
+};
+
+export type RobotStatusFrame = {
+  kind: typeof KIND_ROBOT_STATUS; seq: number;
+  status: RobotStatus;
 };
 
 export type PointsFrame = {
@@ -173,7 +187,8 @@ export type StatsFrame = {
 export type Frame =
   | PointsFrame | MeshFrame | JpegFrame | MetaFrame
   | ModelStateFrame | SamStateFrame | MaskFrame | StatsFrame
-  | RobotGeometryFrame | RobotTransformsFrame | CamCalibFrame;
+  | RobotGeometryFrame | RobotTransformsFrame | CamCalibFrame
+  | RobotStatusFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -303,6 +318,11 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
       const calib = JSON.parse(text) as CamCalibPayload;
       return { kind: KIND_CAM_CALIB, seq, calib };
+    }
+    case KIND_ROBOT_STATUS: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const status = JSON.parse(text) as RobotStatus;
+      return { kind: KIND_ROBOT_STATUS, seq, status };
     }
   }
   return null;
