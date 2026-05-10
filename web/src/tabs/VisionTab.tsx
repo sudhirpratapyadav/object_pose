@@ -1,0 +1,403 @@
+/**
+ * Vision tab: source + depth model + calibration sliders + viewer toggles.
+ * Owned state is hoisted into App.tsx and passed in so the 3D viewer
+ * (which lives outside the tabs) sees the same state.
+ */
+
+import { useRef, useState, useEffect } from "react";
+import { CamCalibPanel } from "../CamCalibPanel";
+import { StreamState } from "../useStream";
+
+type Props = {
+  stream: StreamState;
+  // viewer-state lifted from App so the persistent <Viewer> can read these
+  pointSize: number;
+  setPointSize: (v: number) => void;
+  inversePerspective: boolean;
+  setInversePerspective: (v: boolean) => void;
+  display: "points" | "mesh" | "both";
+  setDisplay: (v: "points" | "mesh" | "both") => void;
+  showCamera: boolean;
+  setShowCamera: (v: boolean) => void;
+  showBBox: boolean;
+  setShowBBox: (v: boolean) => void;
+  showRobot: boolean;
+  setShowRobot: (v: boolean) => void;
+  showEeAxes: boolean;
+  setShowEeAxes: (v: boolean) => void;
+  showWorldAxes: boolean;
+  setShowWorldAxes: (v: boolean) => void;
+  showWorldHandle: boolean;
+  setShowWorldHandle: (v: boolean) => void;
+  gizmoMode: "translate" | "rotate";
+  setGizmoMode: (v: "translate" | "rotate") => void;
+  // RGB / depth / normal preview support
+  imgUrl: string | null;
+  depthUrl: string | null;
+  normalUrl: string | null;
+  onSegClick: (rect: DOMRect, x: number, y: number) => void;
+};
+
+export function VisionTab(props: Props) {
+  const {
+    stream,
+    pointSize, setPointSize,
+    inversePerspective, setInversePerspective,
+    display, setDisplay,
+    showCamera, setShowCamera,
+    showBBox, setShowBBox,
+    showRobot, setShowRobot,
+    showEeAxes, setShowEeAxes,
+    showWorldAxes, setShowWorldAxes,
+    showWorldHandle, setShowWorldHandle,
+    gizmoMode, setGizmoMode,
+    imgUrl, depthUrl, normalUrl, onSegClick,
+  } = props;
+
+  const models = stream.meta?.models ?? [];
+  const currentModel = stream.modelState?.model ?? stream.meta?.default_model ?? "";
+  const samModels = stream.meta?.sam_models ?? [];
+  const currentSamModel = stream.samState?.model ?? stream.meta?.sam_default_model ?? "";
+
+  return (
+    <>
+      <div className="row">
+        <div className="label">Source</div>
+        <div className="segmented">
+          <button
+            className={stream.meta?.source.kind === "live" ? "active" : ""}
+            onClick={() => stream.setSource("live")}
+          >live</button>
+          <button
+            className={stream.meta?.source.kind === "video" ? "active" : ""}
+            onClick={() => {
+              const v = stream.meta?.source.video
+                ?? stream.meta?.videos?.[0]
+                ?? null;
+              if (v) stream.setSource("video", v);
+            }}
+            disabled={!stream.meta?.videos?.length}
+          >video</button>
+        </div>
+        {stream.meta?.source.kind === "video" && (
+          <select
+            className="select"
+            value={stream.meta?.source.video ?? ""}
+            disabled={!stream.meta?.videos?.length}
+            onChange={(e) => stream.setSource("video", e.target.value)}
+          >
+            {(stream.meta?.videos ?? []).map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      <div className="row">
+        <div className="label">Depth model</div>
+        <select
+          className="select"
+          value={currentModel}
+          disabled={!models.length}
+          onChange={(e) => stream.setModel(e.target.value)}
+        >
+          {models.map((m) => {
+            const isCamera = m === "camera-depth";
+            const label = isCamera
+              ? (stream.meta?.camera_depth_label ?? "Camera depth")
+              : m;
+            const disabled = isCamera && !stream.meta?.camera_depth_available;
+            return (
+              <option key={m} value={m} disabled={disabled}>
+                {label}{disabled ? " (unavailable)" : ""}
+              </option>
+            );
+          })}
+        </select>
+        <div className="help">{stream.modelState ? renderStatus(stream.modelState) : "—"}</div>
+      </div>
+
+      <div className="row">
+        <div className="label">Display</div>
+        <div className="segmented">
+          {(["points", "mesh", "both"] as const).map((m) => (
+            <button
+              key={m}
+              className={display === m ? "active" : ""}
+              onClick={() => setDisplay(m)}
+            >{m}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="row">
+        <div className="label">Point size · {pointSize.toFixed(3)}</div>
+        <input
+          className="range" type="range" min={0.001} max={0.1} step={0.001}
+          value={pointSize}
+          onChange={(e) => setPointSize(parseFloat(e.target.value))}
+        />
+        <label className="toggle">
+          <input
+            type="checkbox" checked={inversePerspective}
+            onChange={(e) => setInversePerspective(e.target.checked)}
+          />
+          Inverse-perspective
+        </label>
+      </div>
+
+      <div className="row">
+        <label className="toggle">
+          <input type="checkbox" checked={showCamera}
+                 onChange={(e) => setShowCamera(e.target.checked)} />
+          Camera axes
+        </label>
+        <label className="toggle">
+          <input type="checkbox" checked={showWorldAxes}
+                 onChange={(e) => setShowWorldAxes(e.target.checked)} />
+          World axes
+        </label>
+        <label className="toggle">
+          <input type="checkbox" checked={showWorldHandle}
+                 onChange={(e) => setShowWorldHandle(e.target.checked)} />
+          World handle
+        </label>
+        <label className="toggle">
+          <input type="checkbox" checked={showBBox}
+                 onChange={(e) => setShowBBox(e.target.checked)} />
+          Show 3D bounding box
+        </label>
+      </div>
+
+      {(showCamera || showWorldHandle) && (
+        <div className="row">
+          <div className="label">Gizmo</div>
+          <div className="segmented">
+            <button
+              className={gizmoMode === "translate" ? "active" : ""}
+              onClick={() => setGizmoMode("translate")}
+              title="Drag colored arrows to translate (T)"
+            >Translate</button>
+            <button
+              className={gizmoMode === "rotate" ? "active" : ""}
+              onClick={() => setGizmoMode("rotate")}
+              title="Drag colored rings to rotate (R)"
+            >Rotate</button>
+          </div>
+        </div>
+      )}
+
+      {stream.meta?.robot?.enabled && (
+        <div className="row">
+          <label className="toggle">
+            <input type="checkbox" checked={showRobot}
+                   onChange={(e) => setShowRobot(e.target.checked)} />
+            Show robot
+          </label>
+          <label className="toggle">
+            <input type="checkbox" checked={showEeAxes}
+                   onChange={(e) => setShowEeAxes(e.target.checked)} />
+            Show EE axes
+          </label>
+        </div>
+      )}
+
+      <CamCalibPanel stream={stream} />
+
+      {/* SAM2 + RGB/depth/normal previews stay on the Vision tab. */}
+      <div className="row">
+        <div className="label">SAM2 model</div>
+        <select
+          className="select"
+          value={currentSamModel}
+          disabled={!samModels.length}
+          onChange={(e) => stream.setSamModel(e.target.value)}
+        >
+          {samModels.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+        <div className="kv">
+          <span>{stream.samState ? renderSamStatus(stream.samState) : "—"}</span>
+          <span className="kv-val mono">
+            {stream.stats && stream.stats.sam_ms > 0
+              ? `${stream.stats.sam_ms} ms`
+              : "—"}
+          </span>
+        </div>
+      </div>
+
+      <div className="row">
+        <div className="label">RGB · click to segment</div>
+        <div className="img-frame">
+          <MaskedRgb imgUrl={imgUrl} stream={stream} onClick={onSegClick} />
+          <span className="badge">
+            <b>{stream.stats ? stream.stats.rgb_fps.toFixed(1) : "—"}</b>
+            {" fps "}
+            <span className="dim">
+              {stream.meta ? `· ${stream.meta.rgb_w}×${stream.meta.rgb_h}` : ""}
+            </span>
+          </span>
+        </div>
+      </div>
+
+      <div className="row">
+        <div className="label">Depth</div>
+        {depthUrl ? (
+          <div className="img-frame">
+            <img src={depthUrl} className="thumb" />
+            <span className="badge">
+              <b>{stream.stats ? stream.stats.depth_fps.toFixed(1) : "—"}</b>
+              {" fps "}
+              <span className="dim">
+                {stream.meta ? `· ${stream.meta.infer_w}×${stream.meta.infer_h}` : ""}
+              </span>
+            </span>
+          </div>
+        ) : <div className="help">—</div>}
+      </div>
+
+      {stream.modelState?.has_normals && (
+        <div className="row">
+          <div className="label">Normals</div>
+          {normalUrl ? (
+            <div className="img-frame">
+              <img src={normalUrl} className="thumb" />
+              <span className="badge">
+                <span className="dim">
+                  {stream.meta ? `${stream.meta.infer_w}×${stream.meta.infer_h}` : ""}
+                </span>
+              </span>
+            </div>
+          ) : <div className="help">—</div>}
+        </div>
+      )}
+
+      <button className="button accent" onClick={() => stream.samClear()}>
+        Clear selection
+      </button>
+    </>
+  );
+}
+
+
+function renderStatus(s: { status: string; progress: string; file: string }): string {
+  if (s.status === "downloading") {
+    const pct = s.progress ? `${s.progress}%` : "";
+    return `downloading ${s.file} ${pct}`.trim();
+  }
+  if (s.status === "error") return `error: ${s.file}`;
+  return s.status;
+}
+
+function renderSamStatus(s: { status: string; file: string }): string {
+  if (s.status === "downloading") return `downloading ${s.file}`.trim();
+  if (s.status === "error") return `error: ${s.file}`;
+  return s.status;
+}
+
+
+// MaskedRgb is duplicated here from App.tsx (we'll consolidate later).
+// Kept inline for now to avoid touching the existing class.
+function MaskedRgb({ imgUrl, stream, onClick }: {
+  imgUrl: string | null;
+  stream: StreamState;
+  onClick: (rect: DOMRect, clientX: number, clientY: number) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const lastBlobRef = useRef<string | null>(null);
+  const [pulse, setPulse] = useState<{ x: number; y: number; key: number } | null>(null);
+  const [pending, setPending] = useState(false);
+  const pendingMaskSeqRef = useRef<number>(-1);
+
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      const m = stream.maskRef.current;
+      if (m && m.seq !== pendingMaskSeqRef.current) {
+        pendingMaskSeqRef.current = m.seq;
+        setPending(false);
+      }
+      if (alive) raf = requestAnimationFrame(tick);
+    };
+    let raf = requestAnimationFrame(tick);
+    return () => { alive = false; cancelAnimationFrame(raf); };
+  }, [stream]);
+
+  useEffect(() => {
+    let alive = true;
+    const draw = () => {
+      const canvas = canvasRef.current;
+      const meta = stream.meta;
+      if (!canvas || !meta) {
+        if (alive) raf = requestAnimationFrame(draw);
+        return;
+      }
+      if (imgUrl && lastBlobRef.current !== imgUrl) {
+        const next = new Image();
+        next.onload = () => { imgRef.current = next; };
+        next.src = imgUrl;
+        lastBlobRef.current = imgUrl;
+      }
+      const img = imgRef.current;
+      const W = canvas.clientWidth || meta.rgb_w;
+      const targetH = Math.round(W * meta.rgb_h / meta.rgb_w);
+      if (canvas.width !== W || canvas.height !== targetH) {
+        canvas.width = W;
+        canvas.height = targetH;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) { if (alive) raf = requestAnimationFrame(draw); return; }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (img && img.complete && img.naturalWidth > 0) {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
+      const m = stream.maskRef.current;
+      if (m && m.mask.length === meta.mesh_grid_w * meta.mesh_grid_h) {
+        const gw = meta.mesh_grid_w, gh = meta.mesh_grid_h;
+        const overlay = ctx.createImageData(gw, gh);
+        const buf = overlay.data;
+        for (let i = 0; i < gw * gh; i++) {
+          const on = m.mask[i] !== 0;
+          buf[i * 4 + 0] = 255;
+          buf[i * 4 + 1] = 170;
+          buf[i * 4 + 2] = 51;
+          buf[i * 4 + 3] = on ? 140 : 0;
+        }
+        const off = document.createElement("canvas");
+        off.width = gw; off.height = gh;
+        const offCtx = off.getContext("2d");
+        if (offCtx) {
+          offCtx.putImageData(overlay, 0, 0);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+        }
+      }
+      if (alive) raf = requestAnimationFrame(draw);
+    };
+    let raf = requestAnimationFrame(draw);
+    return () => { alive = false; cancelAnimationFrame(raf); };
+  }, [stream, imgUrl]);
+
+  const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    setPulse({ x: e.clientX - rect.left, y: e.clientY - rect.top, key: Date.now() });
+    setPending(true);
+    pendingMaskSeqRef.current = stream.maskRef.current?.seq ?? -1;
+    onClick(rect, e.clientX, e.clientY);
+  };
+
+  return (
+    <div className="mask-wrap">
+      <canvas ref={canvasRef} className="canvas-mask" onClick={handleClick} />
+      {pulse && (
+        <span
+          key={pulse.key}
+          className="pulse"
+          style={{ left: pulse.x, top: pulse.y }}
+          onAnimationEnd={() => setPulse(null)}
+        />
+      )}
+      {pending && <div className="spinner" />}
+    </div>
+  );
+}

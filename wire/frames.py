@@ -25,6 +25,8 @@ KIND_ROBOT_GEOMETRY   = 10
 KIND_ROBOT_TRANSFORMS = 11
 KIND_CAM_CALIB        = 12
 KIND_ROBOT_STATUS     = 13
+KIND_CONTROLLER_STATE = 14
+KIND_LOG_LINES        = 15
 
 
 def pack_header(seq: int, kind: int) -> bytes:
@@ -135,6 +137,16 @@ def encode_cam_calib(seq: int, payload: dict) -> bytes:
 def encode_robot_status(seq: int, payload: dict) -> bytes:
     """1 Hz robot status: OSC rate, mode, error string, etc."""
     return pack_header(seq, KIND_ROBOT_STATUS) + json.dumps(payload).encode("utf-8")
+
+
+def encode_controller_state(seq: int, payload: dict) -> bytes:
+    """Controller dispatcher state: available list, current name, status."""
+    return pack_header(seq, KIND_CONTROLLER_STATE) + json.dumps(payload).encode("utf-8")
+
+
+def encode_log_lines(seq: int, lines: list[dict]) -> bytes:
+    """Batch of log records:  [{ts, level, source, msg}, ...]."""
+    return pack_header(seq, KIND_LOG_LINES) + json.dumps(lines).encode("utf-8")
 
 
 def encode_robot_transforms(seq: int, xpos: np.ndarray, xquat: np.ndarray) -> bytes:

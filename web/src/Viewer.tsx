@@ -444,6 +444,66 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     worldGizmoT.addEventListener("objectChange", sendCalibFromWorldGizmo);
     worldGizmoR.addEventListener("objectChange", sendCalibFromWorldGizmo);
 
+    // ── EE-target gizmo (ee_pose controller) ────────────────────────────
+    // A draggable handle at the EE target. The handle's pose is the
+    // setpoint sent to the OSC controller. Visibility/enable is gated on
+    // (controller==ee_pose && status==running) and the gizmoMode toggle.
+    const eeTarget = new THREE.Group();
+    eeTarget.name = "ee-target";
+    // Small triad so the gizmo origin is visible even when no controls
+    // are showing (good for sanity-checks while dragging).
+    const eeAxes = new THREE.AxesHelper(0.08);
+    eeTarget.add(eeAxes);
+    scene.add(eeTarget);
+
+    const eeGizmoT = new TransformControls(camera, renderer.domElement);
+    eeGizmoT.setMode("translate");
+    eeGizmoT.setSpace("world");
+    eeGizmoT.size = 0.85;
+    eeGizmoT.attach(eeTarget);
+    const eeGizmoR = new TransformControls(camera, renderer.domElement);
+    eeGizmoR.setMode("rotate");
+    eeGizmoR.setSpace("world");
+    eeGizmoR.size = 0.85;
+    eeGizmoR.attach(eeTarget);
+    const eeGizmoTHelper = eeGizmoT.getHelper();
+    const eeGizmoRHelper = eeGizmoR.getHelper();
+    scene.add(eeGizmoTHelper);
+    scene.add(eeGizmoRHelper);
+
+    let suppressEeEcho = false;
+    const onEeDragging = (ev: { value: unknown }) => {
+      const dragging = !!ev.value;
+      controls.enabled = !dragging;
+      if (dragging) {
+        suppressEeEcho = true;
+      } else {
+        // Send one final sync immediately, then re-allow echo after RTT.
+        sendEeFromGizmo(true);
+        setTimeout(() => { suppressEeEcho = false; }, 250);
+      }
+    };
+    eeGizmoT.addEventListener("dragging-changed", onEeDragging);
+    eeGizmoR.addEventListener("dragging-changed", onEeDragging);
+
+    let lastEeSent = 0;
+    const EE_SEND_PERIOD_MS = 33;     // ~30 Hz
+    const sendEeFromGizmo = (force = false) => {
+      const now = performance.now();
+      if (!force && now - lastEeSent < EE_SEND_PERIOD_MS) return;
+      lastEeSent = now;
+      const p = eeTarget.position;
+      const q = eeTarget.quaternion;   // three uses xyzw on .quaternion
+      streamRef.current.setEeTarget(
+        [p.x, p.y, p.z],
+        [q.x, q.y, q.z, q.w],
+      );
+    };
+    eeGizmoT.addEventListener("objectChange", () => sendEeFromGizmo());
+    eeGizmoR.addEventListener("objectChange", () => sendEeFromGizmo());
+
+    let lastEeKey = "";
+
     // Resize
     const onResize = () => {
       const w = container.clientWidth, h = container.clientHeight;
@@ -517,6 +577,33 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       worldGizmoRHelper.visible = wrOn;
       worldGizmoT.enabled = wtOn;
       worldGizmoR.enabled = wrOn;
+
+      // EE-target gizmo: only shown for the active ee_pose controller.
+      const cs = streamRef.current.controllerState;
+      const eeOn = !!(cs && cs.current === "ee_pose" && cs.status === "running");
+      eeTarget.visible = eeOn;
+      const etOn = eeOn && p.gizmoMode === "translate";
+      const erOn = eeOn && p.gizmoMode === "rotate";
+      eeGizmoTHelper.visible = etOn;
+      eeGizmoRHelper.visible = erOn;
+      eeGizmoT.enabled = etOn;
+      eeGizmoR.enabled = erOn;
+
+      // Pull the latest target from the server when not dragging. The
+      // server publishes shm_qtarget every 1 s plus on every controller
+      // transition; the gizmo snaps to the seeded value on engage.
+      if (eeOn && !suppressEeEcho && cs?.ee_target) {
+        const t = cs.ee_target;
+        const key = `${t.pos.join(",")}|${t.quat_xyzw.join(",")}`;
+        if (key !== lastEeKey) {
+          lastEeKey = key;
+          eeTarget.position.set(t.pos[0], t.pos[1], t.pos[2]);
+          eeTarget.quaternion.set(
+            t.quat_xyzw[0], t.quat_xyzw[1], t.quat_xyzw[2], t.quat_xyzw[3],
+          );
+        }
+      }
+      if (!eeOn) lastEeKey = "";   // re-seed next time it engages
       uniforms.uBaseSize.value = p.pointSize;
       uniforms.uInversePerspective.value = p.inversePerspective ? 1.0 : 0.0;
 
@@ -614,14 +701,18 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       // Detach + remove helpers. Skip TransformControls.dispose() — in
       // three r169 it calls this.traverse() but TransformControls extends
       // Controls (not Object3D), so it throws.
-      for (const g of [gizmoT, gizmoR, worldGizmoT, worldGizmoR]) g.detach();
-      for (const h of [gizmoTHelper, gizmoRHelper, worldGizmoTHelper, worldGizmoRHelper]) {
+      for (const g of [gizmoT, gizmoR, worldGizmoT, worldGizmoR,
+                       eeGizmoT, eeGizmoR]) g.detach();
+      for (const h of [gizmoTHelper, gizmoRHelper, worldGizmoTHelper, worldGizmoRHelper,
+                       eeGizmoTHelper, eeGizmoRHelper]) {
         scene.remove(h);
         if (typeof (h as { dispose?: () => void }).dispose === "function") {
           (h as { dispose: () => void }).dispose();
         }
       }
       scene.remove(worldHandle);
+      scene.remove(eeTarget);
+      eeAxes.dispose();
       controls.dispose();
       renderer.dispose();
       pointsMat.dispose();

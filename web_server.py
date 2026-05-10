@@ -29,7 +29,10 @@ from config import (
     matrix_to_quat_wxyz, save_cam_calib,
     write_factory_intrinsics, FACTORY_INTR_PATH,
 )
-from depth import BACKENDS, create_shm, depth_worker, DEFAULT_MODEL
+from depth import (
+    BACKENDS, create_shm, depth_worker, DEFAULT_MODEL,
+    resolve_default_model,
+)
 from segment import (
     BACKENDS as SAM_BACKENDS,
     DEFAULT_MODEL as SAM_DEFAULT_MODEL,
@@ -47,7 +50,9 @@ from wire import (
     KIND_DEPTH_JPEG,
     KIND_NORMAL_JPEG,
     encode_cam_calib,
+    encode_controller_state,
     encode_jpeg,
+    encode_log_lines,
     encode_mask,
     encode_mesh,
     encode_meta,
@@ -160,7 +165,13 @@ async def handler(ws, hub: Hub, get_connect_frames,
                   on_set_source,
                   on_set_cam_extrinsics, on_save_cam_extrinsics,
                   on_reload_cam_extrinsics,
-                  on_set_target_ctrl) -> None:
+                  on_set_target_ctrl,
+                  on_set_controller, on_stop_controller, on_home_robot,
+                  on_recover_robot, on_restart_transport,
+                  on_set_joint_target,
+                  on_set_ee_target,
+                  on_set_controller_gains, on_save_controller_gains,
+                  on_reload_controller_gains) -> None:
     await hub.add(ws)
     try:
         for frame in get_connect_frames():
@@ -203,6 +214,40 @@ async def handler(ws, hub: Hub, get_connect_frames,
                 elif "set_target_ctrl" in cmd and isinstance(cmd["set_target_ctrl"], list):
                     vals = [float(x) for x in cmd["set_target_ctrl"]]
                     await on_set_target_ctrl(vals)
+                elif "set_controller" in cmd:
+                    await on_set_controller(str(cmd["set_controller"]))
+                elif "stop_controller" in cmd:
+                    await on_stop_controller()
+                elif "home_robot" in cmd:
+                    await on_home_robot()
+                elif "recover_robot" in cmd:
+                    await on_recover_robot()
+                elif "restart_transport" in cmd:
+                    await on_restart_transport()
+                elif "set_joint_target" in cmd and isinstance(cmd["set_joint_target"], list):
+                    vals = [float(x) for x in cmd["set_joint_target"]]
+                    await on_set_joint_target(vals)
+                elif "set_ee_target" in cmd and isinstance(cmd["set_ee_target"], dict):
+                    e = cmd["set_ee_target"]
+                    pos = e.get("pos") or []
+                    quat = e.get("quat_xyzw") or []
+                    if len(pos) == 3 and len(quat) == 4:
+                        await on_set_ee_target(
+                            [float(x) for x in pos],
+                            [float(x) for x in quat],
+                        )
+                elif "set_controller_gains" in cmd and isinstance(cmd["set_controller_gains"], dict):
+                    g = cmd["set_controller_gains"]
+                    n = str(g.get("name", ""))
+                    kp = [float(x) for x in (g.get("kp") or [])]
+                    kd = [float(x) for x in (g.get("kd") or [])]
+                    await on_set_controller_gains(n, kp, kd)
+                elif "save_controller_gains" in cmd:
+                    # Client sends the controller name as the value.
+                    n = str(cmd["save_controller_gains"])
+                    await on_save_controller_gains(n)
+                elif "reload_controller_gains" in cmd:
+                    await on_reload_controller_gains()
     finally:
         await hub.remove(ws)
 
@@ -379,6 +424,14 @@ async def main_async(args) -> None:
 
     build_session(args.source, args.video)
 
+    # Resolve the depth-model default now that we know whether the camera
+    # supplied a depth stream. Honoured by the rest of the boot path
+    # (state["model"], make_meta_payload(), spawn_depth(args.model)).
+    cam_depth_avail = sess["shm"].depth_stream is not None
+    args.model = resolve_default_model(cam_depth_avail, args.model)
+    print(f"[depth] default model: {args.model} "
+          f"(camera_depth_available={cam_depth_avail})", flush=True)
+
     def make_meta_payload() -> dict:
         intr = sess["intr"]
         shm = sess["shm"]
@@ -391,7 +444,7 @@ async def main_async(args) -> None:
             "mesh_grid_w": shm.mesh_grid_w, "mesh_grid_h": shm.mesh_grid_h,
             "viz_hz": VIZ_HZ,
             "models": list(BACKENDS.keys()),
-            "default_model": DEFAULT_MODEL,
+            "default_model": args.model,
             "camera_depth_available": shm.depth_stream is not None,
             "camera_depth_label": (
                 "Camera depth (MuJoCo)" if args.mode == "sim"
@@ -766,112 +819,487 @@ async def main_async(args) -> None:
             if sim["proc"].is_alive():
                 sim["proc"].terminate()
 
-    # ---- Hardware worker (--robot-source hardware) -----------------------
+    # ---- Hardware: transport process + controller dispatcher ------------
+    from collections import deque
+    fault_history: deque = deque(maxlen=32)
     hw_state: dict = {
-        "proc": None,
-        "stop_ev": None,
-        "reset_ev": None,
-        "reset_done_ev": None,
-        "shm_target": None,
-        "shm_gains": None,
-        "shm_hz": None,
-        "shm_gripper": None,
-        "hz": 0.0,
+        # Transport process + its shms.
+        "transport_proc": None,
+        "transport_stop": None,
+        "shm_q":          None,    # joint angles from robot (rad)
+        "shm_dq":         None,    # joint velocities (rad/s)
+        "shm_state_seq":  None,
+        "shm_cmd_mode":   None,
+        "shm_tau":        None,
+        "shm_qtarget":    None,
+        "shm_gripper":    None,
+        "shm_cmd_seq":    None,
+        "shm_hz":         None,
+        "shm_phase":      None,
+        "shm_fault_msg":  None,
+        "swap_request_ev": None,
+        "swap_target_mode": None,
+        "swap_done_ev":   None,
+        # Controller process state.
+        "ctrl_name":   "idle",
+        "ctrl_proc":   None,
+        "ctrl_stop":   None,
+        "ctrl_status": "idle",   # 'idle' | 'loading' | 'running' | 'stopping' | 'fault'
+        "ctrl_error":  "",
     }
+
+    def _read_ee_target() -> dict | None:
+        """Snapshot shm_qtarget[:7] = [pos(3), quat_xyzw(4)] when meaningful.
+
+        Returns None if hardware isn't loaded. Always present (even when not
+        running ee_pose) — the gizmo is hidden client-side based on the
+        current controller; the value here is just the last-written setpoint.
+        """
+        sm = hw_state.get("shm_qtarget")
+        if sm is None:
+            return None
+        with sm.get_lock():
+            arr = np.frombuffer(sm.get_obj(), dtype=np.float64)[:7].copy()
+        return {
+            "pos":       [float(arr[0]), float(arr[1]), float(arr[2])],
+            "quat_xyzw": [float(arr[3]), float(arr[4]), float(arr[5]), float(arr[6])],
+        }
+
+    def _broadcast_controller_state_sync():
+        """Build the controller-state payload (called from sync code paths)."""
+        from controllers import CONTROLLERS
+        return {
+            "available": [
+                {"name": info.name, "display_name": info.display_name,
+                 "description": info.description, "command_mode": info.command_mode}
+                for (info, _) in CONTROLLERS.values()
+            ],
+            "current": hw_state["ctrl_name"],
+            "status":  hw_state["ctrl_status"],
+            "last_error": hw_state["ctrl_error"],
+            "configs":  hw_state.get("ctrl_configs", {}),
+            "ee_target": _read_ee_target(),
+        }
+
+    async def _broadcast_controller_state():
+        await hub.broadcast(encode_controller_state(0, _broadcast_controller_state_sync()))
 
     if args.robot_source == "hardware":
         from hardware import (
-            real_robot_process, PinocchioArm, kinova_deg_to_rad,
-            HOME_DEG, GAINS_KEYS,
+            transport_process,
+            CMD_MODE_IDLE, CMD_MODE_TORQUE, CMD_MODE_POSITION,
         )
 
-        # Read-only seed: compute home EE pose and write into shm_target so
-        # the OSC loop tracks itself at home (no motion until/unless someone
-        # writes a new target).
-        try:
-            arm_init = PinocchioArm(args.robot_arm_mjcf, ee_frame="pinch_site")
-        except Exception as exc:
-            print(f"[hw] failed to load arm MJCF '{args.robot_arm_mjcf}': "
-                  f"{exc}", flush=True)
-            return
-        home_q = kinova_deg_to_rad(HOME_DEG)
-        home_pos, home_rot = arm_init.fk(home_q)
-        # Pinocchio uses XYZW quat convention; build it from rotation matrix
-        # via SciPy-equivalent path. We just need a valid xyzw: convert via
-        # our own helper.
-        wxyz = matrix_to_quat_wxyz(home_rot)
-        # OSC expects target = [pos(3), quat_xyzw(4)]
-        target_init = np.zeros(7, dtype=np.float64)
-        target_init[:3] = home_pos
-        target_init[3:6] = wxyz[1:4]    # x, y, z
-        target_init[6]   = wxyz[0]      # w
-        del arm_init  # free pinocchio resources held in this process
+        # Shared log queue: subprocesses push records, stream_loop drains.
+        log_q = mp.Queue(maxsize=2000)
 
-        # Conservative defaults — same as cam_calib_old.
-        gains_init = np.array([5.0, 0.0, 1.0, 0.0, 10.0, 2.0, 0.0],
-                              dtype=np.float64)
-        assert len(gains_init) == len(GAINS_KEYS)
+        # Allocate all shms the transport + controllers share.
+        shm_q          = mp.Array("d", 7, lock=True)
+        shm_dq         = mp.Array("d", 7, lock=True)
+        shm_state_seq  = mp.Value("I", 0, lock=True)
+        shm_cmd_mode   = mp.Value("B", CMD_MODE_IDLE, lock=True)
+        shm_tau        = mp.Array("d", 7, lock=True)
+        shm_qtarget    = mp.Array("d", 7, lock=True)
+        shm_gripper    = mp.Array("d", 1, lock=True)
+        shm_cmd_seq    = mp.Value("I", 0, lock=True)
+        # Controller gains slot: 14 doubles. Layout depends on the
+        # active controller (e.g. joint_pd uses kp[7] || kd[7]).
+        shm_gains      = mp.Array("d", 14, lock=True)
+        shm_hz         = mp.Array("d", 1, lock=True)
+        shm_phase      = mp.Value("B", 0, lock=True)
+        shm_fault_msg  = mp.Array("c", 256, lock=True)
+        swap_request_ev = mp.Event()
+        swap_target_mode = mp.Value("B", CMD_MODE_IDLE, lock=True)
+        swap_done_ev    = mp.Event()
+        transport_stop  = mp.Event()
 
-        shm_target  = mp.Array("d", target_init, lock=True)
-        shm_gains   = mp.Array("d", gains_init, lock=True)
-        # lock=True so .get_obj() works for np.frombuffer in stream_loop.
-        shm_hz      = mp.Array("d", 1, lock=True)
-        shm_gripper = mp.Array("d", 1, lock=True)
-        hw_stop_ev      = mp.Event()
-        hw_reset_ev     = mp.Event()
-        hw_reset_done   = mp.Event()
+        # Controller defaults loaded from YAML (per-machine tuning).
+        from controllers.configs import load_configs as load_ctrl_cfg
+        ctrl_configs = load_ctrl_cfg()
+
         hw_state.update(
-            stop_ev=hw_stop_ev, reset_ev=hw_reset_ev, reset_done_ev=hw_reset_done,
-            shm_target=shm_target, shm_gains=shm_gains,
-            shm_hz=shm_hz, shm_gripper=shm_gripper,
+            shm_q=shm_q, shm_dq=shm_dq, shm_state_seq=shm_state_seq,
+            shm_cmd_mode=shm_cmd_mode, shm_tau=shm_tau,
+            shm_qtarget=shm_qtarget, shm_gripper=shm_gripper,
+            shm_cmd_seq=shm_cmd_seq, shm_hz=shm_hz,
+            shm_phase=shm_phase, shm_fault_msg=shm_fault_msg,
+            swap_request_ev=swap_request_ev, swap_target_mode=swap_target_mode,
+            swap_done_ev=swap_done_ev, transport_stop=transport_stop,
+            shm_gains=shm_gains,
+            ctrl_configs=ctrl_configs,
+            log_q=log_q,
         )
 
-        # Reuse the existing robot.shm.qpos slot so the OSC loop's joint-angle
-        # output flows through the same FK + transform broadcast as sim/dummy.
-        # OSC writes 7-DOF arm (rad); the rest of robot.shm.nq is zero/unused
-        # for the FK display (gripper joints stay at 0 until we wire grippers).
-        # If nq != 7 we need a tiny adapter: write into the first 7 slots.
-        if robot["shm"].nq < 7:
-            print(f"[hw] robot shm has nq={robot['shm'].nq}, expected >=7",
-                  flush=True)
-            return
-
-        # The OSC loop expects shm_q to be 7-long. We have a 15-DOF qpos shm
-        # (arm + gripper joints) — slice it. Easiest: pass a separate small
-        # 7-DOF shm and copy into the main qpos slot in stream_loop.
-        shm_q_arm = mp.Array("d", 7, lock=True)
-        hw_state["shm_q_arm"] = shm_q_arm
-
-        hw_proc = mp.Process(
-            target=real_robot_process,
-            args=(args.robot_ip, args.robot_arm_mjcf,
-                  shm_q_arm, shm_target, shm_gains, shm_hz, shm_gripper,
-                  hw_stop_ev, hw_reset_ev, hw_reset_done),
-            kwargs={"ee_frame": "pinch_site"},
+        transport_proc = mp.Process(
+            target=transport_process,
+            args=(args.robot_ip,),
+            kwargs={
+                "shm_q": shm_q, "shm_dq": shm_dq, "shm_state_seq": shm_state_seq,
+                "shm_cmd_mode": shm_cmd_mode, "shm_tau": shm_tau,
+                "shm_qtarget": shm_qtarget, "shm_gripper": shm_gripper,
+                "shm_cmd_seq": shm_cmd_seq,
+                "stop_ev": transport_stop,
+                "swap_request_ev": swap_request_ev,
+                "swap_target_mode": swap_target_mode,
+                "swap_done_ev": swap_done_ev,
+                "shm_hz": shm_hz, "shm_phase": shm_phase,
+                "shm_fault_msg": shm_fault_msg,
+                "log_q": log_q,
+            },
             daemon=True,
         )
-        hw_proc.start()
-        hw_state["proc"] = hw_proc
-        print(f"[hw] OSC process started (ip={args.robot_ip}, "
-              f"mjcf={args.robot_arm_mjcf})", flush=True)
+        transport_proc.start()
+        hw_state["transport_proc"] = transport_proc
+        print(f"[hw] transport process started (ip={args.robot_ip})",
+              flush=True)
+
+        # The default 'idle' controller process gets spawned lazily by
+        # on_set_controller — start it now so the dispatcher state is
+        # consistent.
+        # (We do this in main_async after make_meta_payload is defined,
+        # so push to a deferred init below.)
+
+    async def on_set_controller(name: str) -> None:
+        """SST: stop current controller → home robot → start new controller."""
+        if args.robot_source != "hardware":
+            return
+        from controllers import CONTROLLERS
+        from hardware import CMD_MODE_IDLE, CMD_MODE_TORQUE, CMD_MODE_POSITION
+
+        if name not in CONTROLLERS:
+            print(f"[ctrl] unknown controller '{name}'", flush=True)
+            return
+        if name == hw_state["ctrl_name"] and hw_state["ctrl_status"] == "running":
+            return  # no-op
+
+        info, factory = CONTROLLERS[name]
+
+        # --- 1. Stop current controller ---
+        hw_state["ctrl_status"] = "stopping"
+        hw_state["ctrl_error"] = ""
+        await _broadcast_controller_state()
+        if hw_state["ctrl_stop"] is not None:
+            hw_state["ctrl_stop"].set()
+        if hw_state["ctrl_proc"] is not None:
+            await asyncio.to_thread(_join_controller, hw_state["ctrl_proc"])
+        hw_state["ctrl_proc"] = None
+        hw_state["ctrl_stop"] = None
+
+        # --- 2. Tell transport: SST to target command mode ---
+        # Always go through home pose. target_mode = the new controller's mode.
+        mode_map = {
+            "idle":     CMD_MODE_IDLE,
+            "torque":   CMD_MODE_TORQUE,
+            "position": CMD_MODE_POSITION,
+        }
+        target_mode = mode_map[info.command_mode]
+        with hw_state["swap_target_mode"].get_lock():
+            hw_state["swap_target_mode"].value = target_mode
+        hw_state["swap_done_ev"].clear()
+        hw_state["swap_request_ev"].set()
+        hw_state["ctrl_name"] = name
+        hw_state["ctrl_status"] = "loading"
+        await _broadcast_controller_state()
+        # Wait for transport to finish the swap.
+        ok = await asyncio.to_thread(hw_state["swap_done_ev"].wait, 30.0)
+        if not ok:
+            hw_state["ctrl_status"] = "fault"
+            hw_state["ctrl_error"] = "transport SST timed out"
+            await _broadcast_controller_state()
+            return
+
+        # --- 3. Pre-fill shm_gains from this controller's defaults ---
+        cfg = hw_state.get("ctrl_configs", {}).get(name, {})
+        _seed_gains(hw_state["shm_gains"], name, cfg)
+
+        # --- 4. Spawn new controller ---
+        log_q = hw_state.get("log_q")
+        target_callable, ctrl_kwargs = (
+            factory(mjcf_path=args.robot_arm_mjcf, log_q=log_q,
+                    shm_gains=hw_state["shm_gains"])
+            if info.command_mode != "idle"
+            else factory(log_q=log_q)
+        )
+        ctrl_stop = mp.Event()
+        ctrl_proc = mp.Process(
+            target=target_callable,
+            args=(hw_state["shm_q"], hw_state["shm_dq"], hw_state["shm_state_seq"],
+                  hw_state["shm_cmd_mode"], hw_state["shm_tau"],
+                  hw_state["shm_qtarget"], hw_state["shm_gripper"],
+                  hw_state["shm_cmd_seq"],
+                  ctrl_stop),
+            kwargs=ctrl_kwargs,
+            daemon=True,
+        )
+        ctrl_proc.start()
+        hw_state["ctrl_proc"] = ctrl_proc
+        hw_state["ctrl_stop"] = ctrl_stop
+
+        # Wait for the controller to finish seeding its setpoint (every
+        # torque controller bumps shm_cmd_seq after the first write). This
+        # makes the "running" broadcast contain a meaningful ee_target so
+        # the browser gizmo snaps to the real seed instead of zeros.
+        if info.command_mode != "idle":
+            with hw_state["shm_cmd_seq"].get_lock():
+                start_seq = int(hw_state["shm_cmd_seq"].value)
+
+            def _wait_seed():
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    with hw_state["shm_cmd_seq"].get_lock():
+                        if int(hw_state["shm_cmd_seq"].value) != start_seq:
+                            return True
+                    time.sleep(0.005)
+                return False
+            await asyncio.to_thread(_wait_seed)
+
+        hw_state["ctrl_status"] = "running"
+        print(f"[ctrl] running '{name}'", flush=True)
+        await _broadcast_controller_state()
+
+    async def on_stop_controller() -> None:
+        await on_set_controller("idle")
+
+    async def on_home_robot() -> None:
+        """Home = Stop + resume.
+
+        Snapshots the active controller, drives to idle (SST passes
+        through home), then re-engages the same controller. Use as a
+        'panic, return to home' button: works in any mode, doesn't
+        leave the user in idle if they were tuning a controller.
+
+        From idle, just stays in idle (the SST already put us at home).
+        """
+        prev = hw_state["ctrl_name"]
+        await on_set_controller("idle")
+        if prev != "idle" and hw_state["ctrl_status"] != "fault":
+            await on_set_controller(prev)
+
+    async def on_recover_robot() -> None:
+        """Recovery from fault: same as set_controller('idle') today since
+        the SST already does clear_faults + JointMove home + high-level."""
+        await on_set_controller("idle")
+
+    async def on_set_joint_target(vals: list[float]) -> None:
+        """UI publishes a 7-DOF q_des (rad). The active controller (e.g.
+        joint_pd) reads this each cycle as its joint setpoint. Bumping
+        cmd_seq is harmless for torque-mode controllers (they're already
+        running at 500 Hz from state_seq) but matters for position mode.
+        """
+        if args.robot_source != "hardware":
+            return
+        if hw_state["shm_qtarget"] is None or hw_state["shm_cmd_seq"] is None:
+            return
+        if len(vals) != 7:
+            print(f"[ctrl] ignoring set_joint_target: got {len(vals)} values, "
+                  f"expected 7", flush=True)
+            return
+        with hw_state["shm_qtarget"].get_lock():
+            np.frombuffer(hw_state["shm_qtarget"].get_obj(),
+                          dtype=np.float64)[:7] = vals
+        with hw_state["shm_cmd_seq"].get_lock():
+            hw_state["shm_cmd_seq"].value = (hw_state["shm_cmd_seq"].value + 1) & 0xFFFFFFFF
+
+    async def on_set_ee_target(pos: list[float], quat_xyzw: list[float]) -> None:
+        """UI publishes a 6-DoF EE target (world frame). Layout in
+        shm_qtarget matches controllers/ee_pose.py: [pos(3), quat_xyzw(4)].
+
+        Quaternion is normalised; degenerate input is rejected.
+        """
+        if args.robot_source != "hardware":
+            return
+        if hw_state["shm_qtarget"] is None or hw_state["shm_cmd_seq"] is None:
+            return
+        if len(pos) != 3 or len(quat_xyzw) != 4:
+            print(f"[ctrl] ignoring set_ee_target: pos={len(pos)} quat={len(quat_xyzw)}",
+                  flush=True)
+            return
+        q = np.asarray(quat_xyzw, dtype=np.float64)
+        n = float(np.linalg.norm(q))
+        if not np.isfinite(n) or n < 1e-6:
+            print(f"[ctrl] ignoring set_ee_target: degenerate quat", flush=True)
+            return
+        q = q / n
+        with hw_state["shm_qtarget"].get_lock():
+            arr = np.frombuffer(hw_state["shm_qtarget"].get_obj(), dtype=np.float64)
+            arr[0:3] = pos
+            arr[3:7] = q
+        with hw_state["shm_cmd_seq"].get_lock():
+            hw_state["shm_cmd_seq"].value = (hw_state["shm_cmd_seq"].value + 1) & 0xFFFFFFFF
+
+    async def on_set_controller_gains(name: str, kp: list[float],
+                                       kd: list[float]) -> None:
+        """Live update controller gains. Writes to shm_gains (the active
+        controller reads it next cycle) AND updates the in-memory config
+        dict so the next save_controller_gains will persist this state.
+        Layout follows _seed_gains: joint_pd packs kp[7]||kd[7], ee_pose
+        uses scalars in slots 0..6.
+        """
+        if args.robot_source != "hardware":
+            return
+        cfg = hw_state.setdefault("ctrl_configs", {}).setdefault(name, {})
+        if name == "joint_pd":
+            if len(kp) != 7 or len(kd) != 7:
+                print(f"[ctrl] joint_pd needs kp[7]+kd[7]; got {len(kp)}+{len(kd)}",
+                      flush=True)
+                return
+            cfg["kp"] = list(kp)
+            cfg["kd"] = list(kd)
+        else:
+            print(f"[ctrl] set_controller_gains unsupported for '{name}'", flush=True)
+            return
+        # Push to shm only if this is the *active* controller.
+        if hw_state["ctrl_name"] == name:
+            _seed_gains(hw_state["shm_gains"], name, cfg)
+        await _broadcast_controller_state()
+
+    async def on_save_controller_gains(name: str) -> None:
+        """Persist the in-memory config for ``name`` to controllers/configs.yaml."""
+        from controllers.configs import save_configs as save_ctrl_cfg
+        try:
+            await asyncio.to_thread(
+                save_ctrl_cfg, hw_state.get("ctrl_configs", {}))
+            print(f"[ctrl] saved configs.yaml: {name} = "
+                  f"{hw_state.get('ctrl_configs', {}).get(name)}", flush=True)
+        except Exception as exc:
+            print(f"[ctrl] save_controller_gains failed: {exc}", flush=True)
+
+    async def on_reload_controller_gains() -> None:
+        """Re-read controllers/configs.yaml from disk."""
+        from controllers.configs import load_configs as load_ctrl_cfg
+        try:
+            cfg = await asyncio.to_thread(load_ctrl_cfg)
+        except Exception as exc:
+            print(f"[ctrl] reload_controller_gains failed: {exc}", flush=True)
+            return
+        hw_state["ctrl_configs"] = cfg
+        # Re-seed shm_gains for the active controller from the fresh values.
+        active = hw_state["ctrl_name"]
+        if active in cfg:
+            _seed_gains(hw_state["shm_gains"], active, cfg[active])
+        await _broadcast_controller_state()
+
+    async def on_restart_transport() -> None:
+        """Hard recovery: kill the transport process, respawn it.
+
+        Use only when the SST itself stalls (transport unresponsive). The
+        kortex link gets a fresh connection; controller state is reset to
+        idle.
+        """
+        if args.robot_source != "hardware":
+            return
+        print("[hw] restart_transport: stopping current controller…", flush=True)
+        if hw_state["ctrl_stop"] is not None:
+            hw_state["ctrl_stop"].set()
+        if hw_state["ctrl_proc"] is not None:
+            await asyncio.to_thread(_join_controller, hw_state["ctrl_proc"])
+        hw_state["ctrl_proc"] = None
+        hw_state["ctrl_stop"] = None
+        hw_state["ctrl_name"] = "idle"
+        hw_state["ctrl_status"] = "loading"
+        hw_state["ctrl_error"] = ""
+        await _broadcast_controller_state()
+
+        print("[hw] restart_transport: stopping transport…", flush=True)
+        if hw_state["transport_stop"] is not None:
+            hw_state["transport_stop"].set()
+        if hw_state["transport_proc"] is not None:
+            await asyncio.to_thread(
+                hw_state["transport_proc"].join, 15.0)
+            if hw_state["transport_proc"].is_alive():
+                print("[hw] restart_transport: transport still alive, terminating",
+                      flush=True)
+                hw_state["transport_proc"].terminate()
+                await asyncio.to_thread(
+                    hw_state["transport_proc"].join, 2.0)
+
+        # Reset events for fresh life.
+        hw_state["transport_stop"] = mp.Event()
+        hw_state["swap_request_ev"].clear()
+        hw_state["swap_done_ev"].clear()
+
+        from hardware import transport_process
+        new_proc = mp.Process(
+            target=transport_process,
+            args=(args.robot_ip,),
+            kwargs={
+                "shm_q": hw_state["shm_q"], "shm_dq": hw_state["shm_dq"],
+                "shm_state_seq": hw_state["shm_state_seq"],
+                "shm_cmd_mode":  hw_state["shm_cmd_mode"],
+                "shm_tau":       hw_state["shm_tau"],
+                "shm_qtarget":   hw_state["shm_qtarget"],
+                "shm_gripper":   hw_state["shm_gripper"],
+                "shm_cmd_seq":   hw_state["shm_cmd_seq"],
+                "stop_ev":       hw_state["transport_stop"],
+                "swap_request_ev":  hw_state["swap_request_ev"],
+                "swap_target_mode": hw_state["swap_target_mode"],
+                "swap_done_ev":     hw_state["swap_done_ev"],
+                "shm_hz":      hw_state["shm_hz"],
+                "shm_phase":   hw_state["shm_phase"],
+                "shm_fault_msg": hw_state["shm_fault_msg"],
+                "log_q":       hw_state.get("log_q"),
+            },
+            daemon=True,
+        )
+        new_proc.start()
+        hw_state["transport_proc"] = new_proc
+        hw_state["ctrl_status"] = "idle"
+        await _broadcast_controller_state()
+        print("[hw] restart_transport: new transport started", flush=True)
+
+    def _seed_gains(shm, ctrl_name: str, cfg: dict) -> None:
+        """Pack the controller's default gains into shm_gains.
+
+        Layout:
+          joint_pd: [kp(7), kd(7)]
+          ee_pose:  [kp_pos, kd_pos, kp_ori, kd_ori, posture_kp, posture_kd,
+                     posture_weight, 0, 0, 0, 0, 0, 0, 0]  (rest unused)
+          others:   zeros
+        """
+        arr = np.zeros(14, dtype=np.float64)
+        if ctrl_name == "joint_pd":
+            kp = np.asarray(cfg.get("kp", [40, 40, 40, 30, 20, 10, 5]), dtype=np.float64)
+            kd = np.asarray(cfg.get("kd", [4, 4, 4, 3, 2, 1, 0.5]), dtype=np.float64)
+            arr[:7] = kp[:7]
+            arr[7:14] = kd[:7]
+        elif ctrl_name == "ee_pose":
+            arr[0] = float(cfg.get("kp_pos", 5.0))
+            arr[1] = float(cfg.get("kd_pos", 0.0))
+            arr[2] = float(cfg.get("kp_ori", 1.0))
+            arr[3] = float(cfg.get("kd_ori", 0.0))
+            arr[4] = float(cfg.get("posture_kp", 10.0))
+            arr[5] = float(cfg.get("posture_kd", 2.0))
+            arr[6] = float(cfg.get("posture_weight", 0.0))
+        with shm.get_lock():
+            np.frombuffer(shm.get_obj(), dtype=np.float64)[:14] = arr
+
+    def _join_controller(proc: mp.Process) -> None:
+        proc.join(timeout=5.0)
+        if proc.is_alive():
+            print(f"[ctrl] controller didn't exit cleanly; terminating", flush=True)
+            proc.terminate()
+            proc.join(timeout=2.0)
 
     def stop_hardware() -> None:
-        if hw_state["stop_ev"] is not None:
-            hw_state["stop_ev"].set()
-        if hw_state["proc"] is not None:
-            # The OSC subprocess's finally: drives back to home in position
-            # mode (torque-off → high-level → clear-faults → JointMove home →
-            # disconnect). That can take ~15 s; give it 30 before forcing.
-            print("[hw] waiting for OSC subprocess to park the arm…",
+        # Stop controller first.
+        if hw_state["ctrl_stop"] is not None:
+            hw_state["ctrl_stop"].set()
+            if hw_state["ctrl_proc"] is not None:
+                _join_controller(hw_state["ctrl_proc"])
+        # Then transport (its finally: parks the arm).
+        if hw_state["transport_stop"] is not None:
+            print("[hw] stopping transport (will park arm at home)…",
                   flush=True)
-            hw_state["proc"].join(timeout=30.0)
-            if hw_state["proc"].is_alive():
-                print("[hw] OSC subprocess didn't exit cleanly; terminating",
+            hw_state["transport_stop"].set()
+        if hw_state["transport_proc"] is not None:
+            hw_state["transport_proc"].join(timeout=30.0)
+            if hw_state["transport_proc"].is_alive():
+                print("[hw] transport didn't exit cleanly; terminating",
                       flush=True)
-                hw_state["proc"].terminate()
-                hw_state["proc"].join(timeout=2.0)
+                hw_state["transport_proc"].terminate()
+                hw_state["transport_proc"].join(timeout=2.0)
             else:
-                print("[hw] OSC subprocess parked.", flush=True)
+                print("[hw] transport parked.", flush=True)
 
     async def ws_loop():
         def get_connect_frames() -> list[bytes]:
@@ -883,6 +1311,9 @@ async def main_async(args) -> None:
             frames = [meta]
             if robot["enabled"] and robot["geom_payload"]:
                 frames.append(robot["geom_payload"])
+            if args.robot_source == "hardware":
+                frames.append(encode_controller_state(
+                    0, _broadcast_controller_state_sync()))
             return frames
         async with websockets.serve(
             lambda ws: handler(
@@ -893,6 +1324,12 @@ async def main_async(args) -> None:
                 on_set_cam_extrinsics, on_save_cam_extrinsics,
                 on_reload_cam_extrinsics,
                 on_set_target_ctrl,
+                on_set_controller, on_stop_controller, on_home_robot,
+                on_recover_robot, on_restart_transport,
+                on_set_joint_target,
+                on_set_ee_target,
+                on_set_controller_gains, on_save_controller_gains,
+                on_reload_controller_gains,
             ),
             args.host, args.port,
             max_size=None, compression=None, ping_interval=20,
@@ -906,6 +1343,7 @@ async def main_async(args) -> None:
         last_depth_seq = 0
         last_mask_seq = 0
         last_rgb_seq = 0
+        last_phase = -1   # for fault history edge detection
         n_rgb = n_depth = 0
         t_log = time.time()
 
@@ -1018,6 +1456,20 @@ async def main_async(args) -> None:
                 seq += 1
                 n_rgb += 1
 
+            # Drain the log queue and broadcast as a batch (cap at 50/iter
+            # so a flood doesn't starve the rest of the loop).
+            log_q = hw_state.get("log_q")
+            if log_q is not None:
+                batch = []
+                for _ in range(50):
+                    try:
+                        batch.append(log_q.get_nowait())
+                    except Exception:
+                        break
+                if batch:
+                    await hub.broadcast(encode_log_lines(seq, batch))
+                    seq += 1
+
             with shm.depth_seq.get_lock():
                 cur = shm.depth_seq.value
             if cur != last_depth_seq:
@@ -1079,16 +1531,15 @@ async def main_async(args) -> None:
                 )
                 seq += 1
 
-            # Hardware mode: copy the OSC's 7-DOF arm angles (rad) into the
-            # main qpos slot and bump qpos_seq so the FK + transforms branch
-            # below picks them up, same as sim/dummy.
+            # Hardware mode: copy the transport's 7-DOF arm angles (rad)
+            # from shm_q into the robot scene's qpos slot so the existing
+            # FK + transforms broadcast picks them up.
             if (args.robot_source == "hardware"
-                    and hw_state.get("shm_q_arm") is not None
+                    and hw_state.get("shm_q") is not None
                     and robot["shm"] is not None):
-                with hw_state["shm_q_arm"].get_lock():
-                    arm_q = np.frombuffer(hw_state["shm_q_arm"].get_obj(),
-                                          dtype=np.float64).copy()
-                # Don't write a frame of zeros (OSC hasn't reported yet).
+                with hw_state["shm_q"].get_lock():
+                    arm_q = np.frombuffer(hw_state["shm_q"].get_obj(),
+                                          dtype=np.float64)[:7].copy()
                 if np.any(arm_q):
                     cur_qpos = robot["shm"].read_qpos()
                     cur_qpos[:7] = arm_q
@@ -1116,20 +1567,52 @@ async def main_async(args) -> None:
                     "sam_ms":    sam_last_ms["v"],
                 }))
                 seq += 1
-                # Hardware mode: broadcast OSC rate.
+                # Hardware mode: broadcast transport rate + phase + fault.
                 if args.robot_source == "hardware" and hw_state["shm_hz"] is not None:
                     try:
-                        osc_hz = float(np.frombuffer(hw_state["shm_hz"].get_obj(),
-                                                     dtype=np.float64)[0])
+                        with hw_state["shm_hz"].get_lock():
+                            transport_hz = float(np.frombuffer(
+                                hw_state["shm_hz"].get_obj(), dtype=np.float64)[0])
                     except (AttributeError, ValueError):
-                        osc_hz = 0.0
-                    proc_alive = bool(hw_state["proc"] is not None
-                                      and hw_state["proc"].is_alive())
+                        transport_hz = 0.0
+                    transport_alive = bool(
+                        hw_state["transport_proc"] is not None
+                        and hw_state["transport_proc"].is_alive()
+                    )
+                    with hw_state["shm_phase"].get_lock():
+                        phase = int(hw_state["shm_phase"].value)
+                    # Read null-terminated string from shm_fault_msg.
+                    with hw_state["shm_fault_msg"].get_lock():
+                        raw = bytes(hw_state["shm_fault_msg"].get_obj())
+                    fault_msg = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+                    phase_names = {
+                        0: "boot", 1: "homing", 2: "ready",
+                        3: "running", 4: "swapping",
+                        5: "fault", 6: "shutdown",
+                    }
+                    # Edge-detect fault transitions and append to history.
+                    if phase == 5 and last_phase != 5:
+                        fault_history.append({
+                            "ts":     time.time(),
+                            "source": "transport",
+                            "msg":    fault_msg or "(no message)",
+                        })
+                    last_phase = phase
                     await hub.broadcast(encode_robot_status(seq, {
-                        "source": "hardware",
-                        "osc_hz": round(osc_hz, 1),
-                        "alive":  proc_alive,
+                        "source":      "hardware",
+                        "osc_hz":      round(transport_hz, 1),
+                        "alive":       transport_alive,
+                        "phase":       phase,
+                        "phase_name":  phase_names.get(phase, f"phase_{phase}"),
+                        "fault_msg":   fault_msg,
+                        "fault_history": list(fault_history),
                     }))
+                    seq += 1
+                    # Refresh controller_state at the same 1 Hz cadence so
+                    # the EE-target gizmo follows the live setpoint when
+                    # the user isn't dragging.
+                    await hub.broadcast(encode_controller_state(
+                        seq, _broadcast_controller_state_sync()))
                     seq += 1
                 n_rgb = n_depth = 0
                 t_log = time.time()
@@ -1158,7 +1641,10 @@ def main() -> None:
                     help="'realsense' or HTTP URL like 'http://host:8080'")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--model", default="auto",
+                    help="Depth model key, or 'auto' (default): use the camera's "
+                         "own depth stream if available, otherwise the best "
+                         "learned metric backend.")
     ap.add_argument("--sam_model", default=SAM_DEFAULT_MODEL)
     ap.add_argument("--source", default="live", choices=["live", "video"],
                     help="Initial input source ('live' uses --camera; 'video' picks --video).")

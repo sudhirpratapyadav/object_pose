@@ -38,6 +38,8 @@ from .frames import (
     KIND_ROBOT_TRANSFORMS,
     KIND_CAM_CALIB,
     KIND_ROBOT_STATUS,
+    KIND_CONTROLLER_STATE,
+    KIND_LOG_LINES,
     pack_header,
     encode_points,
     encode_mesh,
@@ -51,6 +53,8 @@ from .frames import (
     encode_robot_transforms,
     encode_cam_calib,
     encode_robot_status,
+    encode_controller_state,
+    encode_log_lines,
 )
 
 __all__ = [
@@ -69,6 +73,8 @@ __all__ = [
     "KIND_ROBOT_TRANSFORMS",
     "KIND_CAM_CALIB",
     "KIND_ROBOT_STATUS",
+    "KIND_CONTROLLER_STATE",
+    "KIND_LOG_LINES",
     "pack_header",
     "encode_points",
     "encode_mesh",
@@ -82,4 +88,6 @@ __all__ = [
     "encode_robot_transforms",
     "encode_cam_calib",
     "encode_robot_status",
+    "encode_controller_state",
+    "encode_log_lines",
 ]

@@ -406,3 +406,172 @@ select, input[type="range"], input[type="checkbox"] {
   background: var(--surface-strong);
   color: var(--text);
 }
+
+/* ───────────────────────── Top status bar ───────────────────────── */
+.status-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 14px;
+  background: var(--surface-strong);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border-bottom: 1px solid var(--border);
+  z-index: 50;
+  font-size: 12px;
+  user-select: none;
+}
+.status-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.status-group-right {
+  margin-left: auto;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.status-pill-key {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-faint);
+}
+.status-pill-val {
+  color: var(--text);
+}
+.status-pill-bad {
+  color: var(--bad);
+}
+.status-pill.status-pill-ok {
+  border-color: rgba(95, 210, 138, 0.35);
+  background: rgba(95, 210, 138, 0.08);
+}
+.status-pill.status-pill-ok .status-pill-val {
+  color: var(--ok);
+}
+.status-pill.status-pill-warn {
+  border-color: rgba(255, 184, 77, 0.35);
+  background: rgba(255, 184, 77, 0.08);
+}
+.status-pill.status-pill-warn .status-pill-val {
+  color: var(--warn);
+}
+.status-pill.status-pill-bad {
+  border-color: rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.08);
+}
+.status-pill.status-pill-bad .status-pill-val {
+  color: var(--bad);
+}
+.status-select {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+  cursor: pointer;
+}
+.conn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+}
+.conn-pill.ok  { color: var(--ok); }
+.conn-pill.bad { color: var(--bad); }
+.conn-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 999px;
+  background: var(--bad);
+  box-shadow: 0 0 0 2px rgba(255, 107, 107, 0.18);
+}
+.conn-dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 2px rgba(95, 210, 138, 0.22);
+}
+.status-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  transition: background 0.12s, border-color 0.12s;
+}
+.status-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-strong);
+}
+.status-btn-bad {
+  border-color: rgba(255, 107, 107, 0.4);
+  color: var(--bad);
+}
+.status-btn-bad:hover {
+  background: rgba(255, 107, 107, 0.12);
+}
+
+/* ───────────────────────── Tab strip ───────────────────────── */
+.tab-strip {
+  position: fixed;
+  top: 38px;
+  left: 0;
+  right: 0;
+  height: 36px;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--surface);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border-bottom: 1px solid var(--border);
+  z-index: 49;
+  user-select: none;
+}
+.tab-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: 0 16px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  border-bottom: 2px solid transparent;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.tab-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+}
+.tab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* Top-left tabbed card slot — shifted below status bar (38px) + tab strip (36px). */
+.slot-tl-tabbed {
+  top: 86px;
+  left: 12px;
+  bottom: 12px;
+  width: 360px;
+}

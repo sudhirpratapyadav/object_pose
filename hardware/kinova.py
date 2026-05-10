@@ -40,6 +40,33 @@ class RobotState:
     velocities_deg: np.ndarray  # (7,)
     torques: np.ndarray         # (7,) measured torques in Nm
     timestamp: float
+    # Fault detection: nonzero if any actuator or the base reports a fault.
+    # We OR all the fault_bank_{a,b} values from the cyclic feedback.
+    fault_bank: int = 0
+    # Convenience: which actuator(s) faulted, by index. Empty when fault_bank=0.
+    faulted_actuators: tuple[int, ...] = ()
+
+
+def _state_from_feedback(fb) -> "RobotState":
+    """Build a RobotState from a kortex BaseCyclic feedback message,
+    aggregating fault flags across the base + all actuators."""
+    base_fault = int(getattr(fb, "fault_bank_a", 0)) | int(getattr(fb, "fault_bank_b", 0))
+    fault_bank = base_fault
+    faulted: list[int] = []
+    for i in range(NUM_JOINTS):
+        a = fb.actuators[i]
+        actu_fault = int(getattr(a, "fault_bank_a", 0)) | int(getattr(a, "fault_bank_b", 0))
+        if actu_fault:
+            faulted.append(i)
+        fault_bank |= actu_fault
+    return RobotState(
+        positions_deg=np.array([fb.actuators[i].position for i in range(NUM_JOINTS)]),
+        velocities_deg=np.array([fb.actuators[i].velocity for i in range(NUM_JOINTS)]),
+        torques=np.array([fb.actuators[i].torque for i in range(NUM_JOINTS)]),
+        timestamp=time.time(),
+        fault_bank=fault_bank,
+        faulted_actuators=tuple(faulted),
+    )
 
 
 class KinovaHardware:
@@ -282,12 +309,7 @@ class KinovaHardware:
     def read_state(self) -> RobotState:
         """Read current robot state via UDP. Raises on failure."""
         fb = self.base_cyclic.RefreshFeedback()
-        return RobotState(
-            positions_deg=np.array([fb.actuators[i].position for i in range(NUM_JOINTS)]),
-            velocities_deg=np.array([fb.actuators[i].velocity for i in range(NUM_JOINTS)]),
-            torques=np.array([fb.actuators[i].torque for i in range(NUM_JOINTS)]),
-            timestamp=time.time(),
-        )
+        return _state_from_feedback(fb)
 
     def send_torques(
         self,
@@ -315,12 +337,7 @@ class KinovaHardware:
         )
 
         fb = self.base_cyclic.Refresh(self._cmd, 0, self._send_opts)
-        return RobotState(
-            positions_deg=np.array([fb.actuators[i].position for i in range(NUM_JOINTS)]),
-            velocities_deg=np.array([fb.actuators[i].velocity for i in range(NUM_JOINTS)]),
-            torques=np.array([fb.actuators[i].torque for i in range(NUM_JOINTS)]),
-            timestamp=time.time(),
-        )
+        return _state_from_feedback(fb)
 
     def send_positions(
         self,

@@ -97,7 +97,28 @@ BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
                                  has_normals=True),
 }
 
-DEFAULT_MODEL = "dav2-indoor-small"
+# Preferred default: use the camera's own depth stream (RealSense or sim
+# render) if it's available — it's metric-correct out of the box. If the
+# camera can't supply depth (e.g. RGB-only Realsense fallback), fall back
+# to MoGe-2 ViT-L with normals: best learned metric scale we've found
+# and ships normals for free.
+DEFAULT_MODEL = CAMERA_DEPTH_KEY
+FALLBACK_MODEL = "moge-2-vitl-normal"
+
+
+def resolve_default_model(camera_depth_available: bool,
+                          requested: str | None = None) -> str:
+    """Pick the active depth model at boot.
+
+    - If the user explicitly passed --model, honour it (no fallback magic).
+    - If the camera depth stream is alive, use it.
+    - Otherwise fall back to the best learned metric backend.
+    """
+    if requested and requested not in ("auto", DEFAULT_MODEL):
+        return requested
+    if camera_depth_available:
+        return CAMERA_DEPTH_KEY
+    return FALLBACK_MODEL
 
 
 def make_backend(key: str, focal_px: float) -> DepthBackend:
@@ -106,6 +127,7 @@ def make_backend(key: str, focal_px: float) -> DepthBackend:
     return BACKENDS[key](focal_px)
 
 
-__all__ = ["BACKENDS", "CAMERA_DEPTH_KEY", "DEFAULT_MODEL",
+__all__ = ["BACKENDS", "CAMERA_DEPTH_KEY", "DEFAULT_MODEL", "FALLBACK_MODEL",
+           "resolve_default_model",
            "make_backend", "make_camera_backend",
            "BackendInfo", "DepthBackend", "CameraDepthBackend"]

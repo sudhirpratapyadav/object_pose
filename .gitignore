@@ -29,3 +29,6 @@ cam_factory_intrinsics.yaml
 
 # Diagnostic dumps from test/ scripts.
 test/_realsense_dump/
+
+# Per-controller defaults — per-machine tuning. Commit the .example only.
+controllers/configs.yaml

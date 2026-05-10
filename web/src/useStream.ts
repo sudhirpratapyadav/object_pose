@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CamCalibPayload,
-  Frame, KIND_CAM_CALIB, KIND_DEPTH_JPEG, KIND_JPEG, KIND_MASK, KIND_MESH,
-  KIND_META, KIND_MODEL_STATE, KIND_NORMAL_JPEG, KIND_POINTS,
-  KIND_ROBOT_GEOMETRY, KIND_ROBOT_STATUS, KIND_ROBOT_TRANSFORMS,
-  KIND_SAM_STATE, KIND_STATS,
+  ControllerState,
+  Frame, KIND_CAM_CALIB, KIND_CONTROLLER_STATE, KIND_DEPTH_JPEG, KIND_JPEG,
+  KIND_LOG_LINES, KIND_MASK, KIND_MESH, KIND_META, KIND_MODEL_STATE,
+  KIND_NORMAL_JPEG, KIND_POINTS, KIND_ROBOT_GEOMETRY, KIND_ROBOT_STATUS,
+  KIND_ROBOT_TRANSFORMS, KIND_SAM_STATE, KIND_STATS,
+  LogLine,
   Meta, ModelState, RobotBody, RobotGeom, RobotMeshIndex,
   RobotStatus, SamState, Stats, parseFrame,
 } from "./protocol";
@@ -41,6 +43,8 @@ export type StreamState = {
   stats: Stats | null;
   camCalib: CamCalibPayload | null;
   robotStatus: RobotStatus | null;
+  controllerState: ControllerState | null;
+  logLines: LogLine[];
   pointsRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; mask: Uint8Array; n: number; seq: number } | null>;
   meshRef: React.MutableRefObject<{ xyz: Float32Array; rgb: Uint8Array; faces: Uint32Array; normal: Float32Array | null; nv: number; nf: number; seq: number } | null>;
   jpegRef: JpegRef;
@@ -62,6 +66,17 @@ export type StreamState = {
   saveCamExtrinsics: () => void;
   reloadCamExtrinsics: () => void;
   setTargetCtrl: (vals: number[]) => void;
+  setController: (name: string) => void;
+  stopController: () => void;
+  homeRobot: () => void;
+  recoverRobot: () => void;
+  restartTransport: () => void;
+  setJointTarget: (vals_rad: number[]) => void;
+  setEeTarget: (pos: [number, number, number],
+                quat_xyzw: [number, number, number, number]) => void;
+  setControllerGains: (name: string, kp: number[], kd: number[]) => void;
+  saveControllerGains: (name: string) => void;
+  reloadControllerGains: () => void;
 };
 
 export function useStream(url: string): StreamState {
@@ -71,6 +86,9 @@ export function useStream(url: string): StreamState {
   const [stats, setStats] = useState<Stats | null>(null);
   const [camCalib, setCamCalib] = useState<CamCalibPayload | null>(null);
   const [robotStatus, setRobotStatus] = useState<RobotStatus | null>(null);
+  const [controllerState, setControllerState] = useState<ControllerState | null>(null);
+  const [logLines, setLogLines] = useState<LogLine[]>([]);
+  const LOG_RING_SIZE = 500;
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const camCalibRef = useRef<CamCalibPayload | null>(null);
@@ -129,6 +147,17 @@ export function useStream(url: string): StreamState {
             break;
           case KIND_ROBOT_STATUS:
             setRobotStatus(frame.status);
+            break;
+          case KIND_CONTROLLER_STATE:
+            setControllerState(frame.state);
+            break;
+          case KIND_LOG_LINES:
+            setLogLines((prev) => {
+              const next = prev.concat(frame.lines);
+              return next.length > LOG_RING_SIZE
+                ? next.slice(next.length - LOG_RING_SIZE)
+                : next;
+            });
             break;
           case KIND_MODEL_STATE:
             setModelState(frame.state);
@@ -236,12 +265,61 @@ export function useStream(url: string): StreamState {
     (vals: number[]) => send({ set_target_ctrl: vals }),
     [],
   );
+  const setController = useCallback(
+    (name: string) => send({ set_controller: name }),
+    [],
+  );
+  const stopController = useCallback(
+    () => send({ stop_controller: true }),
+    [],
+  );
+  const homeRobot = useCallback(
+    () => send({ home_robot: true }),
+    [],
+  );
+  const recoverRobot = useCallback(
+    () => send({ recover_robot: true }),
+    [],
+  );
+  const restartTransport = useCallback(
+    () => send({ restart_transport: true }),
+    [],
+  );
+  const setJointTarget = useCallback(
+    (vals_rad: number[]) => send({ set_joint_target: vals_rad }),
+    [],
+  );
+  const setEeTarget = useCallback(
+    (pos: [number, number, number],
+     quat_xyzw: [number, number, number, number]) =>
+      send({ set_ee_target: { pos, quat_xyzw } }),
+    [],
+  );
+  const setControllerGains = useCallback(
+    (name: string, kp: number[], kd: number[]) =>
+      send({ set_controller_gains: { name, kp, kd } }),
+    [],
+  );
+  const saveControllerGains = useCallback(
+    (name: string) => send({ save_controller_gains: name }),
+    [],
+  );
+  const reloadControllerGains = useCallback(
+    () => send({ reload_controller_gains: true }),
+    [],
+  );
 
   return {
-    meta, modelState, samState, stats, camCalib, robotStatus,
+    meta, modelState, samState, stats, camCalib, robotStatus, controllerState,
+    logLines,
     pointsRef, meshRef, jpegRef, depthJpegRef, normalJpegRef, maskRef,
     robotGeomRef, robotXformRef, camCalibRef,
     connected, setModel, setSamModel, samClick, samClear, setSource,
     setCamExtrinsics, saveCamExtrinsics, reloadCamExtrinsics, setTargetCtrl,
+    setController, stopController, homeRobot,
+    recoverRobot, restartTransport,
+    setJointTarget,
+    setEeTarget,
+    setControllerGains, saveControllerGains, reloadControllerGains,
   };
 }

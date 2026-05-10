@@ -21,6 +21,8 @@ export const KIND_ROBOT_GEOMETRY = 10;
 export const KIND_ROBOT_TRANSFORMS = 11;
 export const KIND_CAM_CALIB = 12;
 export const KIND_ROBOT_STATUS = 13;
+export const KIND_CONTROLLER_STATE = 14;
+export const KIND_LOG_LINES = 15;
 
 // MuJoCo geom type codes (mjtGeom).
 export const GEOM_PLANE     = 0;
@@ -126,15 +128,70 @@ export type CamCalibFrame = {
   calib: CamCalibPayload;
 };
 
+export type FaultEvent = {
+  ts: number;       // unix seconds
+  source: string;
+  msg: string;
+};
+
 export type RobotStatus = {
   source: string;
   osc_hz?: number;
   alive?: boolean;
+  phase?: number;
+  phase_name?: string;     // "boot" | "homing" | "ready" | "running" | "swapping" | "fault" | "shutdown"
+  fault_msg?: string;
+  fault_history?: FaultEvent[];
 };
 
 export type RobotStatusFrame = {
   kind: typeof KIND_ROBOT_STATUS; seq: number;
   status: RobotStatus;
+};
+
+export type ControllerInfo = {
+  name: string;
+  display_name: string;
+  description: string;
+  command_mode: "idle" | "torque" | "position";
+};
+
+export type ControllerStatus = "idle" | "loading" | "running" | "stopping" | "fault";
+
+export type EeTarget = {
+  pos: [number, number, number];           // world frame, metres
+  quat_xyzw: [number, number, number, number]; // unit, [x,y,z,w]
+};
+
+export type ControllerState = {
+  available: ControllerInfo[];
+  current: string;
+  status: ControllerStatus;
+  last_error: string;
+  // Per-controller config dicts (keyed by name). Free-form: each
+  // controller defines its own fields. Used for live gain UI + save/load.
+  configs: Record<string, Record<string, number | number[] | string>>;
+  // Latest EE target (shm_qtarget snapshot). Present in hardware mode;
+  // null otherwise. The browser uses this to seed/refresh the EE-target
+  // gizmo when it's not actively being dragged.
+  ee_target?: EeTarget | null;
+};
+
+export type ControllerStateFrame = {
+  kind: typeof KIND_CONTROLLER_STATE; seq: number;
+  state: ControllerState;
+};
+
+export type LogLine = {
+  ts: number;       // unix seconds
+  level: string;    // 'INFO' | 'WARNING' | 'ERROR' | ...
+  source: string;   // 'transport' | 'ctrl-gravcomp' | etc.
+  msg: string;
+};
+
+export type LogLinesFrame = {
+  kind: typeof KIND_LOG_LINES; seq: number;
+  lines: LogLine[];
 };
 
 export type PointsFrame = {
@@ -188,7 +245,7 @@ export type Frame =
   | PointsFrame | MeshFrame | JpegFrame | MetaFrame
   | ModelStateFrame | SamStateFrame | MaskFrame | StatsFrame
   | RobotGeometryFrame | RobotTransformsFrame | CamCalibFrame
-  | RobotStatusFrame;
+  | RobotStatusFrame | ControllerStateFrame | LogLinesFrame;
 
 const MAGIC = 0x46443350; // 'P3DF' little-endian
 
@@ -323,6 +380,16 @@ export function parseFrame(buf: ArrayBuffer): Frame | null {
       const text = new TextDecoder().decode(new Uint8Array(buf, off));
       const status = JSON.parse(text) as RobotStatus;
       return { kind: KIND_ROBOT_STATUS, seq, status };
+    }
+    case KIND_CONTROLLER_STATE: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const state = JSON.parse(text) as ControllerState;
+      return { kind: KIND_CONTROLLER_STATE, seq, state };
+    }
+    case KIND_LOG_LINES: {
+      const text = new TextDecoder().decode(new Uint8Array(buf, off));
+      const lines = JSON.parse(text) as LogLine[];
+      return { kind: KIND_LOG_LINES, seq, lines };
     }
   }
   return null;

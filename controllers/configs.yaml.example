@@ -1,0 +1,25 @@
+# Per-controller default values.
+#
+# Loaded at server startup. Each entry is keyed by the controller name
+# (matching controllers/__init__.py CONTROLLERS dict). The shape is
+# specific to each controller — see controllers/<name>.py for what fields
+# are honoured.
+#
+# Copy this to controllers/configs.yaml to use. The browser's
+# "Save defaults" button writes back to controllers/configs.yaml.
+
+joint_pd:
+  # Joint-PD + gravity. Per-joint kp / kd in N·m/rad and N·m·s/rad.
+  # Conservative defaults: gentle tracking; bump kp for stiffer hold.
+  kp: [40.0, 40.0, 40.0, 30.0, 20.0, 10.0, 5.0]
+  kd: [4.0,  4.0,  4.0,  3.0,  2.0,  1.0, 0.5]
+
+ee_pose:
+  # OSC torque tracking. (Hardcoded today; YAML wiring lands later.)
+  kp_pos: 5.0
+  kd_pos: 0.0
+  kp_ori: 1.0
+  kd_ori: 0.0
+  posture_kp: 10.0
+  posture_kd: 2.0
+  posture_weight: 0.0
