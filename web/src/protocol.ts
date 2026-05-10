@@ -75,8 +75,11 @@ export type Meta = {
   mesh_grid_w: number; mesh_grid_h: number;
   viz_hz: number;
   models: string[];
+  /** model key -> camera requirement ("rgb" | "rgbd" | "rgb_stereo"). */
+  model_camera_reqs?: Record<string, string>;
   default_model: string;
   camera_depth_available?: boolean;
+  camera_stereo_available?: boolean;
   camera_depth_label?: string;
   model_state?: ModelState;
   sam_models: string[];

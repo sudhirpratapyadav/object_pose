@@ -3,9 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Protocol
 
 import numpy as np
+
+
+class CameraReq(str, Enum):
+    """What the backend needs from the camera.
+
+    RGB_ONLY    : just the color stream — works on any source
+                  (RealSense RGB-only, video file, network camera, sim).
+    RGB_DEPTH   : color + factory-aligned depth + emitter ON
+                  (RealSense with depth, sim render). Required by the
+                  `camera-depth` backend; optional for others.
+    RGB_STEREO  : color + rectified IR pair + emitter OFF
+                  (RealSense D4xx IR-left/right). Required by FoundationStereo.
+    """
+    RGB_ONLY   = "rgb"
+    RGB_DEPTH  = "rgbd"
+    RGB_STEREO = "rgb_stereo"
 
 
 @dataclass
@@ -17,6 +34,7 @@ class BackendInfo:
     infer_w: int = 640     # preferred inference width
     infer_h: int = 480     # preferred inference height
     has_normals: bool = False  # whether infer() also returns surface normals
+    camera_req: CameraReq = CameraReq.RGB_ONLY  # what the backend needs from the camera
 
 
 # status callback takes a tuple of strings/numbers

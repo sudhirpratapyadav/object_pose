@@ -33,6 +33,7 @@ from depth import (
     BACKENDS, create_shm, depth_worker, DEFAULT_MODEL,
     resolve_default_model,
 )
+from depth.backends import CameraReq, FOUNDATION_STEREO_KEYS
 from segment import (
     BACKENDS as SAM_BACKENDS,
     DEFAULT_MODEL as SAM_DEFAULT_MODEL,
@@ -264,13 +265,14 @@ def _make_camera(kind: str, video_name: str | None, args, cam_calib: CamCalib):
         return VideoFile(str(path)), False
     if args.camera == "realsense":
         # Honour YAML resolution; intrinsics get overridden after start().
-        # enable_depth=True; RealSenseRGB will auto-fall-back to color-only
-        # if the camera fails to deliver any frames in RGBD mode.
+        # Boot in 'rgbd' mode so the camera-depth backend (the default boot
+        # pick) has data ready. on_set_model() will reopen the camera if
+        # the user switches to FoundationStereo or a learned monocular.
         cam = RealSenseRGB(
             width=cam_calib.intrinsics.width,
             height=cam_calib.intrinsics.height,
             fps=CAM_FPS,
-            enable_depth=True,
+            mode="rgbd",
         )
         return cam, True
     return NetworkRGB(args.camera), False
@@ -394,16 +396,9 @@ async def main_async(args) -> None:
 
         sx = INFER_W / intr.width
         sy = INFER_H / intr.height
-        # Allocate the camera-depth side channel only when the source can
-        # actually fill it (RealSense with depth, or sim mode).
-        if args.mode == "sim":
-            with_depth_stream = True
-        elif is_realsense:
-            with_depth_stream = bool(getattr(cam, "has_depth", False))
-        else:
-            with_depth_stream = False
-        shm = create_shm(intr.width, intr.height, INFER_W, INFER_H,
-                         with_depth_stream=with_depth_stream)
+        # All side channels (depth_stream, IR pair) are always allocated
+        # so we can switch camera modes without rebuilding shm.
+        shm = create_shm(intr.width, intr.height, INFER_W, INFER_H)
         seg = create_seg_shm(shm.mesh_grid_w, shm.mesh_grid_h)
         sess.update(
             kind=kind, video=video_name,
@@ -424,10 +419,49 @@ async def main_async(args) -> None:
 
     build_session(args.source, args.video)
 
+    def _camera_supports_depth() -> bool:
+        """Whether the active camera CAN produce depth (regardless of
+        current mode). Sim always can; D4xx with reopen() can; video can't.
+        """
+        if args.mode == "sim":
+            return True
+        cam = sess["cam"]
+        # Real RealSense — has reopen() and at least one of has_depth / a
+        # past stereo_calib indicates it's a depth-capable device. Today
+        # we just rely on the class type: anything with reopen() is a
+        # mode-capable camera.
+        return hasattr(cam, "reopen")
+
+    def _camera_supports_stereo() -> bool:
+        """Whether the active camera CAN produce a rectified IR pair."""
+        if args.mode == "sim":
+            return False
+        cam = sess["cam"]
+        if not hasattr(cam, "reopen"):
+            return False
+        # Quickest signal: if we're already in stereo mode, the calib
+        # payload is populated. Otherwise we don't know without trying.
+        # Treat all RealSense as candidates — D4xx ships stereo IR.
+        return True
+
+    def _model_camera_reqs() -> dict[str, str]:
+        """Map of model_key -> camera_req string ("rgb" | "rgbd" | "rgb_stereo").
+        Used by the UI to grey out unsupported entries in the dropdown.
+        """
+        out: dict[str, str] = {}
+        for key, factory in BACKENDS.items():
+            try:
+                info = factory(1.0).info
+            except Exception:
+                info = getattr(factory, "info", None)
+            req = getattr(info, "camera_req", CameraReq.RGB_ONLY)
+            out[key] = req.value if hasattr(req, "value") else str(req)
+        return out
+
     # Resolve the depth-model default now that we know whether the camera
     # supplied a depth stream. Honoured by the rest of the boot path
     # (state["model"], make_meta_payload(), spawn_depth(args.model)).
-    cam_depth_avail = sess["shm"].depth_stream is not None
+    cam_depth_avail = _camera_supports_depth()
     args.model = resolve_default_model(cam_depth_avail, args.model)
     print(f"[depth] default model: {args.model} "
           f"(camera_depth_available={cam_depth_avail})", flush=True)
@@ -443,9 +477,11 @@ async def main_async(args) -> None:
             "cx_infer": sess["cx_i"], "cy_infer": sess["cy_i"],
             "mesh_grid_w": shm.mesh_grid_w, "mesh_grid_h": shm.mesh_grid_h,
             "viz_hz": VIZ_HZ,
-            "models": list(BACKENDS.keys()),
-            "default_model": args.model,
-            "camera_depth_available": shm.depth_stream is not None,
+            "models":         list(BACKENDS.keys()),
+            "model_camera_reqs": _model_camera_reqs(),
+            "default_model":  args.model,
+            "camera_depth_available": _camera_supports_depth(),
+            "camera_stereo_available": _camera_supports_stereo(),
             "camera_depth_label": (
                 "Camera depth (MuJoCo)" if args.mode == "sim"
                 else "Camera depth (RealSense)"
@@ -543,11 +579,44 @@ async def main_async(args) -> None:
         shm = sess["shm"]
         stop_ev  = mp.Event()
         status_q = mp.Queue(maxsize=64)
-        depth_stream_name = (shm.depth_stream.name
-                             if shm.depth_stream is not None else None)
+        depth_stream_name = shm.depth_stream.name
         # Mode-aware label so the dropdown reads naturally.
         depth_label = ("Camera depth (MuJoCo)" if args.mode == "sim"
                        else "Camera depth (RealSense)")
+
+        # FoundationStereo wiring: pull stereo calib from the active camera.
+        ir_left_name = ir_right_name = None
+        stereo_seq = None
+        stereo_calib_payload = None
+        if model_key in FOUNDATION_STEREO_KEYS:
+            cam = sess["cam"]
+            sc = getattr(cam, "stereo_calib", None)
+            if sc is None:
+                # Should never reach here — _camera_mode_for() would have
+                # rejected the switch earlier. Defensive log + skip.
+                print(f"[depth] {model_key} requested but camera has no stereo calib;"
+                      f" worker will fail and stay alive for re-pick.",
+                      flush=True)
+            else:
+                ir_left_name  = shm.ir_left.name
+                ir_right_name = shm.ir_right.name
+                stereo_seq    = shm.stereo_seq
+                # Also include color intrinsics so the FS backend can
+                # warp depth into the color frame the rest of the
+                # pipeline uses.
+                ci = sess["intr"]
+                stereo_calib_payload = {
+                    "fx_ir": sc.fx, "fy_ir": sc.fy,
+                    "cx_ir": sc.cx, "cy_ir": sc.cy,
+                    "ir_w": sc.width, "ir_h": sc.height,
+                    "baseline_m":   sc.baseline_m,
+                    "ir_to_color_R": sc.ir_to_color_R.tolist(),
+                    "ir_to_color_t": sc.ir_to_color_t.tolist(),
+                    "fx_color": ci.fx, "fy_color": ci.fy,
+                    "cx_color": ci.cx, "cy_color": ci.cy,
+                    "color_w":  ci.width, "color_h":  ci.height,
+                }
+
         proc = mp.Process(
             target=depth_worker,
             args=(
@@ -561,6 +630,12 @@ async def main_async(args) -> None:
                 sess["fx_i"], sess["fy_i"], sess["cx_i"], sess["cy_i"],
                 stop_ev, status_q, model_key, "cuda",
                 depth_stream_name, depth_label,
+            ),
+            kwargs=dict(
+                ir_left_name=ir_left_name,
+                ir_right_name=ir_right_name,
+                stereo_seq=stereo_seq,
+                stereo_calib=stereo_calib_payload,
             ),
             daemon=True,
         )
@@ -643,17 +718,111 @@ async def main_async(args) -> None:
                 try: sam_state["status_q"].get_nowait()
                 except Exception: break
 
+    def _camera_mode_for(key: str) -> str | None:
+        """Pick a camera mode that satisfies the backend's CameraReq.
+
+        Returns the mode string ("rgb" / "rgbd" / "rgb_stereo") or None if
+        the active camera can't satisfy this backend's requirement. The
+        caller treats None as a hard reject (stay on current model).
+        """
+        info = None
+        factory = BACKENDS.get(key)
+        if factory is not None:
+            try:
+                info = factory(1.0).info  # cheap metadata-only call
+            except Exception:
+                # Sentinel factories raise; fall back to scanning attrs.
+                info = getattr(factory, "info", None)
+        req = getattr(info, "camera_req", CameraReq.RGB_ONLY)
+        cam = sess["cam"]
+        if req == CameraReq.RGB_ONLY:
+            return "rgb"
+        if req == CameraReq.RGB_DEPTH:
+            # Only D4xx + sim can produce factory-aligned depth. Sim mode
+            # uses the sim worker's depth, not a camera reopen.
+            if args.mode == "sim":
+                return "rgb"
+            if hasattr(cam, "reopen"):
+                return "rgbd"
+            return None
+        if req == CameraReq.RGB_STEREO:
+            if hasattr(cam, "reopen") and getattr(cam, "stereo_calib", None) is not None:
+                return "rgb_stereo"
+            # Active camera doesn't support stereo and we have no way to
+            # try (e.g. video file source).
+            if hasattr(cam, "reopen"):
+                return "rgb_stereo"   # let reopen() try; failure → revert
+            return None
+        return None
+
     async def on_set_model(key: str) -> None:
         if key == state["model"] or key not in BACKENDS:
             return
+        # Pick target camera mode for this backend.
+        target_cam_mode = _camera_mode_for(key)
+        if target_cam_mode is None:
+            # Reject up front: the active camera can't satisfy this backend.
+            err = (f"'{key}' requires a camera that supports its capture "
+                   f"requirement; active camera doesn't.")
+            print(f"[depth] {err}", flush=True)
+            state.update(model_status="error", model_progress="", model_file=err[:200])
+            await hub.broadcast(encode_model_state(0, make_model_state_payload()))
+            # Restore previous status after a beat so the UI doesn't stick
+            # in 'error'.
+            state.update(model_status=f"running {state['model']}",
+                         model_progress="", model_file="")
+            await hub.broadcast(encode_model_state(0, make_model_state_payload()))
+            return
+
         state.update(model_status=f"switching to {key} ...",
                      model_progress="", model_file="")
         await hub.broadcast(encode_model_state(0, make_model_state_payload()))
-        # Run blocking spawn/stop in a thread so we don't stall the loop.
+        # Tear down the depth worker first so it doesn't read partially
+        # filled shm during the camera flip.
         await asyncio.to_thread(stop_depth)
         shm = sess["shm"]
         with shm.pc_count.get_lock():
             shm.pc_count.value = 0
+
+        # Reopen the camera in the new mode if it differs (real-camera path).
+        cam = sess["cam"]
+        prev_mode = getattr(cam, "mode", None)
+        if (prev_mode is not None and prev_mode != target_cam_mode
+                and hasattr(cam, "reopen")):
+            state.update(model_status=f"reconfiguring camera ({target_cam_mode}) ...")
+            await hub.broadcast(encode_model_state(0, make_model_state_payload()))
+            try:
+                new_intr = await asyncio.to_thread(cam.reopen, target_cam_mode)
+                # Refresh inference intrinsics — width/height haven't changed
+                # but fx/fy/cx/cy might (D4xx ships per-stream intrinsics).
+                sx = INFER_W / new_intr.width
+                sy = INFER_H / new_intr.height
+                sess["intr"] = new_intr
+                sess["fx_i"] = new_intr.fx * sx
+                sess["fy_i"] = new_intr.fy * sy
+                sess["cx_i"] = new_intr.cx * sx
+                sess["cy_i"] = new_intr.cy * sy
+                # Push fresh meta to clients (intrinsics may have changed).
+                await hub.broadcast(encode_meta(0, {
+                    **make_meta_payload(),
+                    "model_state": make_model_state_payload(),
+                    "sam_state":   make_sam_state_payload(),
+                }))
+            except Exception as exc:
+                err = f"camera reopen('{target_cam_mode}') failed: {exc}"
+                print(f"[depth] {err}", flush=True)
+                # Try to revert to the previous mode so the rest of the
+                # pipeline keeps running.
+                try:
+                    await asyncio.to_thread(cam.reopen, prev_mode)
+                except Exception as exc2:
+                    print(f"[cam] revert reopen also failed: {exc2}", flush=True)
+                state.update(model_status="error", model_progress="", model_file=err[:200])
+                await hub.broadcast(encode_model_state(0, make_model_state_payload()))
+                # Re-spawn the *previous* model so depth keeps flowing.
+                await asyncio.to_thread(spawn_depth, state["model"])
+                return
+
         await asyncio.to_thread(spawn_depth, key)
         await hub.broadcast(encode_model_state(0, make_model_state_payload()))
 
@@ -796,11 +965,9 @@ async def main_async(args) -> None:
                 "cam_pos":      tuple(float(x) for x in cam_pos),
                 "cam_quat_wxyz": tuple(float(x) for x in cam_quat),
                 "cam_fovy_deg": float(cam_fovy),
-                # Camera-depth side channel: only allocated when depth_stream
-                # shm exists (build_session sets this up in sim mode).
-                "depth_shm_name": (sess["shm"].depth_stream.name
-                                   if sess["shm"].depth_stream is not None else None),
-                "rgbd_seq":     sess["shm"].rgbd_seq,
+                # Camera-depth side channel: always allocated now.
+                "depth_shm_name": sess["shm"].depth_stream.name,
+                "rgbd_seq":       sess["shm"].rgbd_seq,
                 "stop_ev":      sim_stop_ev,
                 "open_viewer":  bool(args.mujoco_gui),
             },
@@ -1433,19 +1600,31 @@ async def main_async(args) -> None:
                 with shm.rgb_seq.get_lock():
                     shm.rgb_seq.value += 1
 
-            # If the camera supports depth, copy the latest depth frame into
-            # the side-channel shm and bump rgbd_seq. The camera-depth backend
-            # (when selected) reads from there instead of running an NN.
+            # If the camera is in 'rgbd' mode, copy the latest depth frame
+            # into the side-channel shm and bump rgbd_seq. The camera-depth
+            # backend reads from there instead of running an NN. Sim mode:
+            # the sim worker writes depth_stream + rgbd_seq directly.
             depth_stream_arr = shm.depth_stream_arr()
-            if depth_stream_arr is not None:
-                if hasattr(cam, "get_depth"):
-                    depth_m = cam.get_depth()
-                    if depth_m is not None:
-                        depth_stream_arr[...] = depth_m
-                        with shm.rgbd_seq.get_lock():
-                            shm.rgbd_seq.value += 1
-                # Sim mode: the sim worker writes depth_stream + rgbd_seq
-                # directly (task 17), nothing to do here.
+            if hasattr(cam, "get_depth"):
+                depth_m = cam.get_depth()
+                if depth_m is not None and depth_m.shape == depth_stream_arr.shape:
+                    depth_stream_arr[...] = depth_m
+                    with shm.rgbd_seq.get_lock():
+                        shm.rgbd_seq.value += 1
+
+            # If the camera is in 'rgb_stereo' mode, push the IR pair to
+            # their side channels so the FoundationStereo backend can read
+            # them. Bump stereo_seq on every successful pair.
+            if hasattr(cam, "get_stereo"):
+                pair = cam.get_stereo()
+                if pair is not None:
+                    ir1, ir2 = pair
+                    if (ir1.shape == shm.ir_left_arr().shape and
+                            ir2.shape == shm.ir_right_arr().shape):
+                        shm.ir_left_arr()[...]  = ir1
+                        shm.ir_right_arr()[...] = ir2
+                        with shm.stereo_seq.get_lock():
+                            shm.stereo_seq.value += 1
 
             with shm.rgb_seq.get_lock():
                 cur_rgb = shm.rgb_seq.value

@@ -14,7 +14,7 @@ from multiprocessing import shared_memory
 import numpy as np
 from PIL import Image
 
-from .base import BackendInfo, StatusFn
+from .base import BackendInfo, CameraReq, StatusFn
 
 
 class CameraDepthBackend:
@@ -72,6 +72,7 @@ def make_camera_backend(label: str, *, depth_shm_name: str,
         infer_w=infer_w,
         infer_h=infer_h,
         has_normals=False,
+        camera_req=CameraReq.RGB_DEPTH,
     )
     return CameraDepthBackend(
         info,

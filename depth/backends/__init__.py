@@ -5,8 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from .base import BackendInfo, DepthBackend
+from .base import BackendInfo, CameraReq, DepthBackend
 from .camera import CameraDepthBackend, make_camera_backend
+from .foundation_stereo import (
+    FoundationStereoBackend, FOUNDATION_STEREO_KEYS,
+    make_foundation_stereo_backend,
+)
 from .hf_pipeline import HFPipelineBackend
 from .metric3d import Metric3DBackend
 from .moge import MoGeBackend
@@ -63,6 +67,29 @@ def _camera_sentinel(focal_px: float) -> DepthBackend:
         "depth worker handles this internally when model_key == 'camera-depth'."
     )
 
+# Attach a .info attribute so callers that just want metadata (UI dropdown,
+# camera_req gate) can read it without hitting the sentinel exception.
+_camera_sentinel.info = BackendInfo(  # type: ignore[attr-defined]
+    key=CAMERA_DEPTH_KEY, label="Camera depth", family="camera", repo="",
+    camera_req=CameraReq.RGB_DEPTH,
+)
+
+
+# Same idea for FoundationStereo: needs runtime IR shm + stereo calib that
+# only the depth_worker has. Sentinel just publishes BackendInfo so the UI
+# dropdown sees it; the worker picks the right path.
+def _make_fs_sentinel(key: str, label: str) -> Callable[[float], DepthBackend]:
+    def factory(focal_px: float) -> DepthBackend:
+        raise RuntimeError(
+            f"{key} must be built via make_foundation_stereo_backend(); "
+            f"the depth worker handles this internally."
+        )
+    factory.info = BackendInfo(  # type: ignore[attr-defined]
+        key=key, label=label, family="foundation-stereo", repo="",
+        camera_req=CameraReq.RGB_STEREO,
+    )
+    return factory
+
 
 # Registry: key -> factory(focal_px) -> DepthBackend
 BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
@@ -95,6 +122,14 @@ BACKENDS: dict[str, Callable[[float], DepthBackend]] = {
                                  "Ruicheng/moge-2-vitl-normal",
                                  "MoGe-2 ViT-L + normal",
                                  has_normals=True),
+    # FoundationStereo (NVlabs). Reads the rectified IR pair (D4xx) and
+    # produces metric depth via stereo matching. Two checkpoint sizes:
+    # 'fs-small' uses ViT-S, 'fs-large' uses ViT-L. Weights live in
+    # weights/foundation_stereo/{small,large}/{cfg.yaml,model_best_bp2.pth}.
+    "fs-small":            _make_fs_sentinel("fs-small",
+                                              "FoundationStereo (ViT-S)"),
+    "fs-large":            _make_fs_sentinel("fs-large",
+                                              "FoundationStereo (ViT-L)"),
 }
 
 # Preferred default: use the camera's own depth stream (RealSense or sim
@@ -128,6 +163,8 @@ def make_backend(key: str, focal_px: float) -> DepthBackend:
 
 
 __all__ = ["BACKENDS", "CAMERA_DEPTH_KEY", "DEFAULT_MODEL", "FALLBACK_MODEL",
+           "FOUNDATION_STEREO_KEYS",
            "resolve_default_model",
-           "make_backend", "make_camera_backend",
-           "BackendInfo", "DepthBackend", "CameraDepthBackend"]
+           "make_backend", "make_camera_backend", "make_foundation_stereo_backend",
+           "BackendInfo", "CameraReq", "DepthBackend", "CameraDepthBackend",
+           "FoundationStereoBackend"]

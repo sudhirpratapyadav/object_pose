@@ -106,10 +106,21 @@ export function VisionTab(props: Props) {
             const label = isCamera
               ? (stream.meta?.camera_depth_label ?? "Camera depth")
               : m;
-            const disabled = isCamera && !stream.meta?.camera_depth_available;
+            // Disable based on the backend's camera requirement.
+            // We could grey out models that need a stream the camera
+            // can't supply (e.g. fs-* on a video source).
+            const reqs = stream.meta?.model_camera_reqs ?? {};
+            const req = reqs[m] ?? "rgb";
+            let disabled = false;
+            let why = "";
+            if (req === "rgbd" && !stream.meta?.camera_depth_available) {
+              disabled = true; why = " (no camera depth)";
+            } else if (req === "rgb_stereo" && !stream.meta?.camera_stereo_available) {
+              disabled = true; why = " (no stereo IR)";
+            }
             return (
               <option key={m} value={m} disabled={disabled}>
-                {label}{disabled ? " (unavailable)" : ""}
+                {label}{disabled ? why : ""}
               </option>
             );
           })}

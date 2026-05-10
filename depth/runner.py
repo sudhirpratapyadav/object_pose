@@ -21,7 +21,8 @@ import numpy as np
 from PIL import Image
 
 from .backends import (
-    CAMERA_DEPTH_KEY, DEFAULT_MODEL, make_backend, make_camera_backend,
+    BACKENDS, CAMERA_DEPTH_KEY, DEFAULT_MODEL, FOUNDATION_STEREO_KEYS,
+    CameraReq, make_backend, make_camera_backend, make_foundation_stereo_backend,
 )
 from .mesh import build_faces, fill_mesh, grid_dims, precompute_unproject
 
@@ -43,13 +44,17 @@ class DepthShm:
     mesh_faces: shared_memory.SharedMemory
     mesh_normal: shared_memory.SharedMemory  # (n_verts, 3) float32, may be all zeros
     normal_img: shared_memory.SharedMemory   # (infer_h, infer_w, 3) float32 normal map
-    # Camera-supplied depth stream (RealSense aligned depth or sim render).
-    # Created at native rgb resolution so the camera writes without resizing.
-    # None if the camera doesn't produce depth.
-    depth_stream: shared_memory.SharedMemory | None
+    # Side channels: always allocated so the camera can switch modes at
+    # runtime without re-creating shm. Each is at native rgb resolution.
+    # The camera writes only the slot(s) its current mode produces; the
+    # *_seq counters tell the depth worker which are fresh.
+    depth_stream: shared_memory.SharedMemory   # (rgb_h, rgb_w) float32 metres
+    ir_left:      shared_memory.SharedMemory   # (rgb_h, rgb_w) uint8 (Y8)
+    ir_right:     shared_memory.SharedMemory   # (rgb_h, rgb_w) uint8 (Y8)
     rgb_seq:   mp.Value
     depth_seq: mp.Value
     rgbd_seq:  mp.Value      # bumped each time depth_stream is written
+    stereo_seq: mp.Value     # bumped each time ir_left+ir_right are written
     pc_count:  mp.Value
     has_normal: mp.Value
     rgb_w:    int
@@ -95,21 +100,27 @@ class DepthShm:
         return np.ndarray((self.infer_h, self.infer_w, 3), dtype=np.float32,
                           buffer=self.normal_img.buf)
 
-    def depth_stream_arr(self) -> np.ndarray | None:
-        """Camera-native depth (metres). Shape: (rgb_h, rgb_w). None if not allocated."""
-        if self.depth_stream is None:
-            return None
+    def depth_stream_arr(self) -> np.ndarray:
+        """Camera-native depth (metres). Shape: (rgb_h, rgb_w)."""
         return np.ndarray((self.rgb_h, self.rgb_w), dtype=np.float32,
                           buffer=self.depth_stream.buf)
 
+    def ir_left_arr(self) -> np.ndarray:
+        """Rectified IR-left frame (Y8). Shape: (rgb_h, rgb_w)."""
+        return np.ndarray((self.rgb_h, self.rgb_w), dtype=np.uint8,
+                          buffer=self.ir_left.buf)
+
+    def ir_right_arr(self) -> np.ndarray:
+        """Rectified IR-right frame (Y8). Shape: (rgb_h, rgb_w)."""
+        return np.ndarray((self.rgb_h, self.rgb_w), dtype=np.uint8,
+                          buffer=self.ir_right.buf)
+
     def _all_shms(self):
-        out = [self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
-               self.pc_grid_idx,
-               self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
-               self.mesh_normal, self.normal_img]
-        if self.depth_stream is not None:
-            out.append(self.depth_stream)
-        return out
+        return [self.rgb, self.depth, self.pc_xyz, self.pc_rgb,
+                self.pc_grid_idx,
+                self.mesh_xyz, self.mesh_rgb, self.mesh_faces,
+                self.mesh_normal, self.normal_img,
+                self.depth_stream, self.ir_left, self.ir_right]
 
     def close(self):
         for shm in self._all_shms():
@@ -123,6 +134,15 @@ class DepthShm:
 
 def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int,
                with_depth_stream: bool = False) -> DepthShm:
+    """Allocate the depth-pipeline shared memory.
+
+    All side channels (depth_stream, ir_left, ir_right) are always
+    allocated so the camera can switch modes at runtime without
+    rebuilding shm. Cost is small (~3 MB at 640x480: depth_stream 1.2 MB
+    + 2 IR slots 0.3 MB each). The ``with_depth_stream`` flag is kept
+    for API compatibility; it no longer changes the layout.
+    """
+    del with_depth_stream  # accepted for compat; layout is now fixed
     n_max = (infer_w // PC_DOWNSAMPLE) * (infer_h // PC_DOWNSAMPLE)
     grid_w, grid_h = grid_dims(infer_w, infer_h, MESH_DOWNSAMPLE)
     n_verts = grid_w * grid_h
@@ -138,17 +158,20 @@ def create_shm(rgb_w: int, rgb_h: int, infer_w: int, infer_h: int,
     mesh_faces = shared_memory.SharedMemory(create=True, size=n_faces * 3 * 4)
     mesh_normal = shared_memory.SharedMemory(create=True, size=n_verts * 3 * 4)
     normal_img  = shared_memory.SharedMemory(create=True, size=infer_h * infer_w * 3 * 4)
-    depth_stream = (shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w * 4)
-                    if with_depth_stream else None)
+    depth_stream = shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w * 4)
+    ir_left      = shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w)
+    ir_right     = shared_memory.SharedMemory(create=True, size=rgb_h * rgb_w)
     return DepthShm(
         rgb=rgb, depth=depth, pc_xyz=pc_xyz, pc_rgb=pc_rgb,
         pc_grid_idx=pc_grid_idx,
         mesh_xyz=mesh_xyz, mesh_rgb=mesh_rgb, mesh_faces=mesh_faces,
         mesh_normal=mesh_normal, normal_img=normal_img,
         depth_stream=depth_stream,
+        ir_left=ir_left, ir_right=ir_right,
         rgb_seq=mp.Value("Q", 0),
         depth_seq=mp.Value("Q", 0),
         rgbd_seq=mp.Value("Q", 0),
+        stereo_seq=mp.Value("Q", 0),
         pc_count=mp.Value("I", 0),
         has_normal=mp.Value("B", 0),
         rgb_w=rgb_w, rgb_h=rgb_h,
@@ -177,6 +200,13 @@ def depth_worker(
     # Camera-depth side channel: only used when model_key == 'camera-depth'.
     depth_stream_name: str | None = None,
     depth_stream_label: str = "Camera depth",
+    # Stereo side channels: only used when the backend is FoundationStereo.
+    # The 'stereo_calib' dict carries IR intrinsics + baseline + IR->color
+    # extrinsics for projecting points into the color frame.
+    ir_left_name: str | None = None,
+    ir_right_name: str | None = None,
+    stereo_seq=None,
+    stereo_calib: dict | None = None,
 ):
     """Inference runs at (infer_w, infer_h). Intrinsics fx/fy/cx/cy are in the
     inference frame (already scaled by caller)."""
@@ -227,6 +257,22 @@ def depth_worker(
                 depth_shm_name=depth_stream_name,
                 src_w=rgb_w, src_h=rgb_h,
                 infer_w=infer_w, infer_h=infer_h,
+            )
+        elif model_key in FOUNDATION_STEREO_KEYS:
+            if not (ir_left_name and ir_right_name and stereo_calib):
+                raise RuntimeError(
+                    "FoundationStereo selected but the camera does not "
+                    "provide a rectified IR pair (RealSense D4xx required). "
+                    "Pick a different model."
+                )
+            backend = make_foundation_stereo_backend(
+                key=model_key,
+                ir_left_shm_name=ir_left_name,
+                ir_right_shm_name=ir_right_name,
+                stereo_seq=stereo_seq,
+                src_w=rgb_w, src_h=rgb_h,
+                infer_w=infer_w, infer_h=infer_h,
+                stereo_calib=stereo_calib,
             )
         else:
             backend = make_backend(model_key, focal_px=float(fx))
