@@ -166,6 +166,31 @@ export type EeTarget = {
   quat_xyzw: [number, number, number, number]; // unit, [x,y,z,w]
 };
 
+export type PolicyInfo = {
+  name: string;
+  display_name: string;
+  description: string;
+  controller: string;
+  needs_object_pose: boolean;
+};
+
+export type ObjectPose = {
+  pos: [number, number, number];   // world frame, metres
+  n_points: number;                // masked-point count behind this estimate
+};
+
+export type PolicyState = {
+  available: PolicyInfo[];
+  current: string;                 // "" if no policy engaged
+  status_code: number;             // 0 waiting, 1 running, 2 success
+  last_error: string;
+  configs: Record<string, Record<string, unknown>>;
+  hz: number;
+  last_action: number[];           // length action_dim (7 for open_drawer)
+  goal: [number, number, number];  // world frame
+  object_pose: ObjectPose | null;
+};
+
 export type ControllerState = {
   available: ControllerInfo[];
   current: string;
@@ -178,6 +203,8 @@ export type ControllerState = {
   // null otherwise. The browser uses this to seed/refresh the EE-target
   // gizmo when it's not actively being dragged.
   ee_target?: EeTarget | null;
+  // Policy block — present in hardware mode, null otherwise.
+  policy?: PolicyState | null;
 };
 
 export type ControllerStateFrame = {

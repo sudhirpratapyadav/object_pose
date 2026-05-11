@@ -77,6 +77,10 @@ export type StreamState = {
   setControllerGains: (name: string, kp: number[], kd: number[]) => void;
   saveControllerGains: (name: string) => void;
   reloadControllerGains: () => void;
+  setPolicy: (name: string) => void;
+  stopPolicy: () => void;
+  savePolicyConfigs: () => void;
+  reloadPolicyConfigs: () => void;
 };
 
 export function useStream(url: string): StreamState {
@@ -308,6 +312,22 @@ export function useStream(url: string): StreamState {
     () => send({ reload_controller_gains: true }),
     [],
   );
+  const setPolicy = useCallback(
+    (name: string) => send({ set_policy: name }),
+    [],
+  );
+  const stopPolicy = useCallback(
+    () => send({ stop_policy: true }),
+    [],
+  );
+  const savePolicyConfigs = useCallback(
+    () => send({ save_policy_configs: true }),
+    [],
+  );
+  const reloadPolicyConfigs = useCallback(
+    () => send({ reload_policy_configs: true }),
+    [],
+  );
 
   return {
     meta, modelState, samState, stats, camCalib, robotStatus, controllerState,
@@ -321,5 +341,6 @@ export function useStream(url: string): StreamState {
     setJointTarget,
     setEeTarget,
     setControllerGains, saveControllerGains, reloadControllerGains,
+    setPolicy, stopPolicy, savePolicyConfigs, reloadPolicyConfigs,
   };
 }

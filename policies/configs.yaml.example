@@ -1,0 +1,50 @@
+# Per-policy defaults. Each entry carries every constant the trained
+# checkpoint expects: gains, action scales, home pose, target rate, etc.
+# When a policy engages, its `controller_gains` are overlaid onto the
+# ee_pose controller for the duration of the run (and restored on stop).
+#
+# Copy this file to configs.yaml and tweak per-machine.
+
+open_drawer:
+  # Path to the rsl_rl PPO checkpoint. Relative to repo root.
+  checkpoint: weights/policies/open_drawer/model_1500.pt
+  obs_dim: 33
+  action_dim: 7
+
+  # Outer-loop rate the policy runs at (Hz). The ee_pose controller still
+  # runs at 500 Hz; the policy just re-issues the target this often.
+  target_hz: 10
+
+  # Home pose used at engage time (Kinova-deg convention).
+  # Must match what the policy was trained from.
+  home_deg: [0.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0]
+
+  # OSC gains for the ee_pose controller while this policy is engaged.
+  # Restored to the user's saved ee_pose gains when the policy stops.
+  controller_gains:
+    kp_pos: 50.0
+    kd_pos: 10.0
+    kp_ori: 50.0
+    kd_ori: 10.0
+    posture_kp: 10.0
+    posture_kd: 2.0
+    posture_weight: 0.0
+
+  # Action -> EE target translation. Each cycle, the next ee_pose target
+  # becomes (current_ee_pose + delta_pos_scale * action[:3],
+  #          current_ee_rot ∘ axis-angle(delta_ori_scale * action[3:6])).
+  delta_pos_scale: 0.005   # metres per unit action
+  delta_ori_scale: 0.01    # rad per unit action
+
+  # Gripper convention (training).
+  # Policy outputs action[6] ∈ [-1, +1]; we map linearly to shm_gripper [0,1].
+  gripper_driver_max: 0.8
+
+  # Task definition.
+  success_thresh: 0.02     # metres; stop once handle within this of goal
+  goal_offset: [-0.15, 0.0, 0.0]   # added to current handle pose at engage time
+
+  # Workspace clip (metres, robot-local frame).
+  # Optional: omit to skip the clip.
+  ws_lo: [0.20, -0.50, 0.05]
+  ws_hi: [0.85,  0.50, 1.00]

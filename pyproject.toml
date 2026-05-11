@@ -53,4 +53,5 @@ build-backend = "hatchling.build"
 mmcv = ["setuptools", "wheel"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["camera", "depth", "segment", "robot", "hardware", "wire", "sim", "controllers"]
+packages = ["camera", "depth", "segment", "robot", "hardware", "wire", "sim",
+            "controllers", "policies", "vision"]

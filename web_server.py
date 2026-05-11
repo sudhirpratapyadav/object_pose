@@ -46,6 +46,7 @@ from robot import (
     create_robot_shm,
     load_robot_scene,
 )
+from vision import compute_object_pose
 from robot.wire import build_robot_geometry_payload
 from wire import (
     KIND_DEPTH_JPEG,
@@ -172,7 +173,9 @@ async def handler(ws, hub: Hub, get_connect_frames,
                   on_set_joint_target,
                   on_set_ee_target,
                   on_set_controller_gains, on_save_controller_gains,
-                  on_reload_controller_gains) -> None:
+                  on_reload_controller_gains,
+                  on_set_policy, on_stop_policy,
+                  on_save_policy_configs, on_reload_policy_configs) -> None:
     await hub.add(ws)
     try:
         for frame in get_connect_frames():
@@ -249,6 +252,14 @@ async def handler(ws, hub: Hub, get_connect_frames,
                     await on_save_controller_gains(n)
                 elif "reload_controller_gains" in cmd:
                     await on_reload_controller_gains()
+                elif "set_policy" in cmd:
+                    await on_set_policy(str(cmd["set_policy"]))
+                elif "stop_policy" in cmd:
+                    await on_stop_policy()
+                elif "save_policy_configs" in cmd:
+                    await on_save_policy_configs()
+                elif "reload_policy_configs" in cmd:
+                    await on_reload_policy_configs()
     finally:
         await hub.remove(ws)
 
@@ -1033,6 +1044,60 @@ async def main_async(args) -> None:
             "quat_xyzw": [float(arr[3]), float(arr[4]), float(arr[5]), float(arr[6])],
         }
 
+    def _read_policy_block() -> dict:
+        """Build the per-broadcast policy snapshot."""
+        from policies import POLICIES
+        # Live stats (rate + last action + status).
+        hz = 0.0
+        last_act = [0.0] * 7
+        status_code = 0
+        if hw_state.get("shm_policy_hz") is not None:
+            with hw_state["shm_policy_hz"].get_lock():
+                hz = float(np.frombuffer(hw_state["shm_policy_hz"].get_obj(),
+                                          dtype=np.float64)[0])
+            with hw_state["shm_policy_last_action"].get_lock():
+                last_act = [float(x) for x in np.frombuffer(
+                    hw_state["shm_policy_last_action"].get_obj(),
+                    dtype=np.float64)[:7]]
+            with hw_state["shm_policy_status"].get_lock():
+                status_code = int(np.frombuffer(
+                    hw_state["shm_policy_status"].get_obj(),
+                    dtype=np.uint8)[0])
+        # Current goal (world frame).
+        goal = [0.0, 0.0, 0.0]
+        if hw_state.get("shm_policy_goal") is not None:
+            with hw_state["shm_policy_goal"].get_lock():
+                goal = [float(x) for x in np.frombuffer(
+                    hw_state["shm_policy_goal"].get_obj(),
+                    dtype=np.float64)[:3]]
+        # Latest object pose (world frame).
+        obj_pose = None
+        if hw_state.get("shm_object_pose") is not None:
+            with hw_state["shm_object_pose_seq"].get_lock():
+                obj_seq = int(hw_state["shm_object_pose_seq"].value)
+            if obj_seq > 0:
+                with hw_state["shm_object_pose"].get_lock():
+                    arr = np.frombuffer(hw_state["shm_object_pose"].get_obj(),
+                                         dtype=np.float64)[:4].copy()
+                obj_pose = {"pos": arr[:3].tolist(), "n_points": int(arr[3])}
+        return {
+            "available": [
+                {"name": info.name, "display_name": info.display_name,
+                 "description": info.description,
+                 "controller": info.controller,
+                 "needs_object_pose": info.needs_object_pose}
+                for (info, _) in POLICIES.values()
+            ],
+            "current":     hw_state.get("policy_name", "") or "",
+            "status_code": status_code,        # 0 waiting, 1 running, 2 success
+            "last_error":  hw_state.get("policy_error", ""),
+            "configs":     hw_state.get("pol_configs", {}),
+            "hz":          round(hz, 1),
+            "last_action": last_act,
+            "goal":        goal,
+            "object_pose": obj_pose,
+        }
+
     def _broadcast_controller_state_sync():
         """Build the controller-state payload (called from sync code paths)."""
         from controllers import CONTROLLERS
@@ -1047,6 +1112,7 @@ async def main_async(args) -> None:
             "last_error": hw_state["ctrl_error"],
             "configs":  hw_state.get("ctrl_configs", {}),
             "ee_target": _read_ee_target(),
+            "policy":   _read_policy_block() if args.robot_source == "hardware" else None,
         }
 
     async def _broadcast_controller_state():
@@ -1085,6 +1151,21 @@ async def main_async(args) -> None:
         from controllers.configs import load_configs as load_ctrl_cfg
         ctrl_configs = load_ctrl_cfg()
 
+        # Policy shared state. Always allocated; the policy subprocess
+        # reads/writes these. shm_object_pose is also written by the
+        # stream_loop (vision side); shm_policy_goal is set by the
+        # server at engage time.
+        shm_object_pose       = mp.Array("d", 4, lock=True)   # [x, y, z, n_points]
+        shm_object_pose_seq   = mp.Value("Q", 0, lock=True)
+        shm_policy_goal       = mp.Array("d", 3, lock=True)
+        shm_policy_hz         = mp.Array("d", 1, lock=True)
+        shm_policy_last_action = mp.Array("d", 7, lock=True)
+        shm_policy_status     = mp.Array("B", 1, lock=True)   # 0=waiting,1=running,2=success
+
+        # Policy defaults loaded from YAML.
+        from policies.configs import load_configs as load_pol_cfg
+        pol_configs = load_pol_cfg()
+
         hw_state.update(
             shm_q=shm_q, shm_dq=shm_dq, shm_state_seq=shm_state_seq,
             shm_cmd_mode=shm_cmd_mode, shm_tau=shm_tau,
@@ -1095,6 +1176,21 @@ async def main_async(args) -> None:
             swap_done_ev=swap_done_ev, transport_stop=transport_stop,
             shm_gains=shm_gains,
             ctrl_configs=ctrl_configs,
+            shm_object_pose=shm_object_pose,
+            shm_object_pose_seq=shm_object_pose_seq,
+            shm_policy_goal=shm_policy_goal,
+            shm_policy_hz=shm_policy_hz,
+            shm_policy_last_action=shm_policy_last_action,
+            shm_policy_status=shm_policy_status,
+            pol_configs=pol_configs,
+            # Policy run state (server-owned)
+            policy_name="",          # "" = no policy engaged
+            policy_proc=None,
+            policy_stop=None,
+            policy_error="",
+            # Snapshot of the user's saved ee_pose gains so we can
+            # restore them when a policy disengages.
+            saved_ee_pose_gains=None,
             log_q=log_q,
         )
 
@@ -1141,6 +1237,11 @@ async def main_async(args) -> None:
             return  # no-op
 
         info, factory = CONTROLLERS[name]
+
+        # --- 0. If a policy is running, stop it. It writes to shm_qtarget;
+        #         keeping it alive across an SST would race with the swap.
+        if hw_state.get("policy_proc") is not None:
+            await on_stop_policy()
 
         # --- 1. Stop current controller ---
         hw_state["ctrl_status"] = "stopping"
@@ -1347,6 +1448,178 @@ async def main_async(args) -> None:
             _seed_gains(hw_state["shm_gains"], active, cfg[active])
         await _broadcast_controller_state()
 
+    # ── Policies ──────────────────────────────────────────────────────────
+    async def on_set_policy(name: str) -> None:
+        """Engage a policy by name. Refuses if:
+        - no policy entry exists in policies/configs.yaml
+        - the active camera + SAM aren't producing a fresh object_pose
+          (when the policy needs one)
+        - the required controller can't be engaged
+        """
+        if args.robot_source != "hardware":
+            return
+        from policies import POLICIES
+
+        if name not in POLICIES:
+            err = f"unknown policy '{name}'"
+            print(f"[pol] {err}", flush=True)
+            hw_state["policy_error"] = err
+            await _broadcast_controller_state()
+            return
+        info, factory = POLICIES[name]
+        cfg = hw_state["pol_configs"].get(name, {})
+        if not cfg:
+            err = f"no config for '{name}' in policies/configs.yaml"
+            print(f"[pol] {err}", flush=True)
+            hw_state["policy_error"] = err
+            await _broadcast_controller_state()
+            return
+
+        # Block on fresh object_pose if needed.
+        if info.needs_object_pose:
+            with hw_state["shm_object_pose_seq"].get_lock():
+                seq = int(hw_state["shm_object_pose_seq"].value)
+            with hw_state["shm_object_pose"].get_lock():
+                obj = np.frombuffer(hw_state["shm_object_pose"].get_obj(),
+                                     dtype=np.float64)[:4].copy()
+            if seq == 0 or obj[3] < 10:
+                err = ("no object_pose available — click the target object "
+                       "in the RGB view to produce a SAM mask first")
+                print(f"[pol] refusing engage: {err}", flush=True)
+                hw_state["policy_error"] = err
+                await _broadcast_controller_state()
+                return
+            handle_world = obj[:3].copy()
+        else:
+            handle_world = np.zeros(3)
+
+        # Stop any prior policy first.
+        if hw_state["policy_proc"] is not None:
+            await on_stop_policy()
+
+        # Snapshot the user's saved ee_pose gains so we can restore.
+        saved = hw_state["ctrl_configs"].get(info.controller, {}).copy()
+        hw_state["saved_ee_pose_gains"] = saved
+
+        # Overlay the policy's controller_gains onto the ee_pose config
+        # and re-seed shm_gains. This affects the *active* controller
+        # immediately and will persist as long as the policy runs.
+        pol_gains = cfg.get("controller_gains", {})
+        new_ctrl_cfg = saved.copy()
+        new_ctrl_cfg.update(pol_gains)
+        hw_state["ctrl_configs"][info.controller] = new_ctrl_cfg
+
+        # If the required controller isn't already running, hot-swap to it.
+        # The hot-swap goes through home anyway. After the swap, we'll
+        # re-issue a JointMove to the policy's home_deg if it differs.
+        if hw_state["ctrl_name"] != info.controller:
+            await on_set_controller(info.controller)
+        else:
+            # Same controller — push the overlay into shm now.
+            _seed_gains(hw_state["shm_gains"], info.controller, new_ctrl_cfg)
+            await _broadcast_controller_state()
+
+        # TODO: per-policy home_deg JointMove. Today we use the default
+        # HOME_DEG inside the SST. If policy's home differs significantly
+        # the user can manually drag the EE gizmo near it first, OR we
+        # add a TCP path here to JointMove to policy.home_deg before
+        # spawning. Left as a follow-up to keep this slice scoped.
+
+        # Compute and store goal pose = handle + offset (world frame).
+        goal_offset = np.asarray(cfg.get("goal_offset", [0, 0, 0]), dtype=np.float64)
+        goal_world = handle_world + goal_offset
+        with hw_state["shm_policy_goal"].get_lock():
+            np.frombuffer(hw_state["shm_policy_goal"].get_obj(),
+                          dtype=np.float64)[:3] = goal_world
+        # Reset stats.
+        with hw_state["shm_policy_hz"].get_lock():
+            np.frombuffer(hw_state["shm_policy_hz"].get_obj(),
+                          dtype=np.float64)[0] = 0.0
+        with hw_state["shm_policy_last_action"].get_lock():
+            np.frombuffer(hw_state["shm_policy_last_action"].get_obj(),
+                          dtype=np.float64)[:7] = 0.0
+        with hw_state["shm_policy_status"].get_lock():
+            np.frombuffer(hw_state["shm_policy_status"].get_obj(),
+                          dtype=np.uint8)[0] = 0
+        # Also re-zero object_pose_seq so the policy waits for a fresh
+        # frame before producing actions.
+        # (Don't zero shm_object_pose itself — keep the latest position
+        # so engage gripper handling is smooth.)
+
+        # Spawn the policy subprocess.
+        target, kwargs = factory(
+            mjcf_path=args.robot_arm_mjcf, cfg=cfg,
+            log_q=hw_state.get("log_q"),
+        )
+        stop_ev = mp.Event()
+        proc = mp.Process(
+            target=target,
+            args=(
+                hw_state["shm_q"], hw_state["shm_dq"], hw_state["shm_state_seq"],
+                hw_state["shm_qtarget"], hw_state["shm_gripper"], hw_state["shm_cmd_seq"],
+                hw_state["shm_object_pose"], hw_state["shm_object_pose_seq"],
+                hw_state["shm_policy_goal"], hw_state["shm_policy_hz"],
+                hw_state["shm_policy_last_action"], hw_state["shm_policy_status"],
+                stop_ev,
+            ),
+            kwargs=kwargs,
+            daemon=True,
+        )
+        proc.start()
+        hw_state["policy_name"]  = name
+        hw_state["policy_proc"]  = proc
+        hw_state["policy_stop"]  = stop_ev
+        hw_state["policy_error"] = ""
+        print(f"[pol] running '{name}'  goal_world={goal_world.round(3)}", flush=True)
+        await _broadcast_controller_state()
+
+    async def on_stop_policy() -> None:
+        """Stop the active policy and restore the user's ee_pose gains."""
+        if args.robot_source != "hardware":
+            return
+        if hw_state["policy_proc"] is None:
+            return
+        name = hw_state["policy_name"]
+        print(f"[pol] stopping '{name}'", flush=True)
+        if hw_state["policy_stop"] is not None:
+            hw_state["policy_stop"].set()
+        if hw_state["policy_proc"] is not None:
+            await asyncio.to_thread(hw_state["policy_proc"].join, 5.0)
+            if hw_state["policy_proc"].is_alive():
+                hw_state["policy_proc"].terminate()
+                await asyncio.to_thread(hw_state["policy_proc"].join, 2.0)
+        hw_state["policy_proc"] = None
+        hw_state["policy_stop"] = None
+        hw_state["policy_name"] = ""
+
+        # Restore the saved ee_pose gains so the controller goes back to
+        # the user's interactive tuning. Only restore if we did snapshot.
+        saved = hw_state.get("saved_ee_pose_gains")
+        if saved is not None:
+            hw_state["ctrl_configs"]["ee_pose"] = saved
+            if hw_state["ctrl_name"] == "ee_pose":
+                _seed_gains(hw_state["shm_gains"], "ee_pose", saved)
+            hw_state["saved_ee_pose_gains"] = None
+        await _broadcast_controller_state()
+
+    async def on_save_policy_configs() -> None:
+        from policies.configs import save_configs as save_pol_cfg
+        try:
+            await asyncio.to_thread(save_pol_cfg, hw_state.get("pol_configs", {}))
+            print(f"[pol] saved policies/configs.yaml", flush=True)
+        except Exception as exc:
+            print(f"[pol] save failed: {exc}", flush=True)
+
+    async def on_reload_policy_configs() -> None:
+        from policies.configs import load_configs as load_pol_cfg
+        try:
+            cfg = await asyncio.to_thread(load_pol_cfg)
+        except Exception as exc:
+            print(f"[pol] reload failed: {exc}", flush=True)
+            return
+        hw_state["pol_configs"] = cfg
+        await _broadcast_controller_state()
+
     async def on_restart_transport() -> None:
         """Hard recovery: kill the transport process, respawn it.
 
@@ -1449,7 +1722,13 @@ async def main_async(args) -> None:
             proc.join(timeout=2.0)
 
     def stop_hardware() -> None:
-        # Stop controller first.
+        # Stop policy first (it writes to shm_qtarget; stale writes during
+        # teardown would confuse the controller).
+        if hw_state.get("policy_stop") is not None:
+            hw_state["policy_stop"].set()
+            if hw_state.get("policy_proc") is not None:
+                hw_state["policy_proc"].join(timeout=3.0)
+        # Then controller.
         if hw_state["ctrl_stop"] is not None:
             hw_state["ctrl_stop"].set()
             if hw_state["ctrl_proc"] is not None:
@@ -1498,6 +1777,8 @@ async def main_async(args) -> None:
                 on_set_ee_target,
                 on_set_controller_gains, on_save_controller_gains,
                 on_reload_controller_gains,
+                on_set_policy, on_stop_policy,
+                on_save_policy_configs, on_reload_policy_configs,
             ),
             args.host, args.port,
             max_size=None, compression=None, ping_interval=20,
@@ -1692,6 +1973,22 @@ async def main_async(args) -> None:
                                     mesh_faces_snap, normal=normal_payload)
                     )
                     seq += 1
+                    # ── Object pose (centroid of masked points, world frame) ──
+                    # Updated every depth frame; the policy reads it via shm.
+                    if (args.robot_source == "hardware"
+                            and hw_state.get("shm_object_pose") is not None):
+                        pos_w, n_in = compute_object_pose(
+                            seg_mask, pc_xyz_snap, pc_idx_snap, T_wc, n,
+                        )
+                        if n_in > 0:
+                            with hw_state["shm_object_pose"].get_lock():
+                                arr = np.frombuffer(
+                                    hw_state["shm_object_pose"].get_obj(),
+                                    dtype=np.float64)
+                                arr[0:3] = pos_w
+                                arr[3]   = float(n_in)
+                            with hw_state["shm_object_pose_seq"].get_lock():
+                                hw_state["shm_object_pose_seq"].value += 1
                 # Always send a colorized depth jpeg, even when pc is empty.
                 depth_bgr = _depth_to_turbo_bgr(depth_buf_snap)
                 await hub.broadcast(

@@ -136,7 +136,7 @@ export default function App() {
           />
         )}
         {tab === "robot" && <RobotTab stream={stream} />}
-        {tab === "policy" && <PolicyTab />}
+        {tab === "policy" && <PolicyTab stream={stream} />}
         {tab === "diagnostics" && <DiagnosticsTab stream={stream} />}
 
         <div className="help" style={{ marginTop: 8 }}>press H to toggle HUD</div>
