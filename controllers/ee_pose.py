@@ -29,6 +29,7 @@ from hardware import (
     HOME_DEG,
     MAX_JOINT_TORQUE,
     PinocchioArm,
+    TAU_OFFSETS,
     compute_osc_torques,
     kinova_deg_to_rad,
 )
@@ -90,6 +91,7 @@ def ee_pose_controller_process(
     mjcf_path: str,
     ee_frame: str = "pinch_site",
     log_q=None,
+    apply_tau_offsets: bool = True,   # hardware bias correction; off in sim
 ):
     """OSC torque controller. Tracks shm_qtarget = [pos, quat_xyzw]."""
     from hardware.log_relay import install_log_relay
@@ -154,6 +156,13 @@ def ee_pose_controller_process(
         except Exception as exc:
             log.exception(f"OSC failed: {exc}")
             tau = np.zeros(7)
+
+        # Hardware-side joint-bias compensation. The real Kinova has
+        # gravity-load skew on joints 3 and 6 that wasn't in training; we
+        # bias the torques to cancel it. Sim is dynamically symmetric so
+        # we leave the offsets off there.
+        if apply_tau_offsets:
+            tau = tau + TAU_OFFSETS
 
         # MAX_JOINT_TORQUE clipping is already inside compute_osc_torques;
         # belt-and-suspenders here too.

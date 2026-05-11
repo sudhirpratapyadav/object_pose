@@ -29,7 +29,7 @@ PIDFILE_VITE="/tmp/object_pose_vite.pid"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 MODE="real"
-ROBOT_SOURCE="hardware"
+ROBOT_SOURCE=""   # auto-resolve: hardware when --mode real, sim when --mode sim
 START_VITE=1
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -47,7 +47,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# In sim mode, robot-source is overridden by web_server.py to 'sim'.
+# Auto-resolve ROBOT_SOURCE based on --mode if the user didn't set it.
+if [[ -z "$ROBOT_SOURCE" ]]; then
+    if [[ "$MODE" == "sim" ]]; then
+        ROBOT_SOURCE="sim"
+    else
+        ROBOT_SOURCE="hardware"
+    fi
+fi
 # Forwarded EXTRA_ARGS land at the end of the python command.
 
 echo "─────────────────────────────────────────"

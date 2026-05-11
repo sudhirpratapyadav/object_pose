@@ -954,41 +954,9 @@ async def main_async(args) -> None:
     # ---- Sim worker (mode == sim) ----------------------------------------
     sim: dict = {"proc": None, "stop_ev": None}
 
-    if args.mode == "sim":
-        from sim import sim_worker, mj_camera_params
-        # Sim worker uses sim_calib (ground truth) for camera placement +
-        # optics. The depth pipeline elsewhere uses sess["calib"] (belief).
-        cam_pos, cam_quat, cam_fovy = mj_camera_params(sim_calib)
-        sim_stop_ev = mp.Event()
-        sim_proc = mp.Process(
-            target=sim_worker,
-            args=(args.mjcf, args.sim_camera),
-            kwargs={
-                "rgb_shm_name": sess["shm"].rgb.name,
-                "rgb_seq":      sess["shm"].rgb_seq,
-                "rgb_w":        sim_calib.intrinsics.width,
-                "rgb_h":        sim_calib.intrinsics.height,
-                "qpos_arr":     robot["shm"].qpos,
-                "qpos_seq":     robot["shm"].qpos_seq,
-                "nq":           robot["shm"].nq,
-                "ctrl_arr":     robot["ctrl_arr"],
-                "ctrl_seq":     robot["ctrl_seq"],
-                "nu":           robot["nu"],
-                "cam_pos":      tuple(float(x) for x in cam_pos),
-                "cam_quat_wxyz": tuple(float(x) for x in cam_quat),
-                "cam_fovy_deg": float(cam_fovy),
-                # Camera-depth side channel: always allocated now.
-                "depth_shm_name": sess["shm"].depth_stream.name,
-                "rgbd_seq":       sess["shm"].rgbd_seq,
-                "stop_ev":      sim_stop_ev,
-                "open_viewer":  bool(args.mujoco_gui),
-            },
-            daemon=True,
-        )
-        sim_proc.start()
-        sim.update(proc=sim_proc, stop_ev=sim_stop_ev)
-        print(f"[sim] worker started (camera={args.sim_camera}, "
-              f"viewer={'on' if args.mujoco_gui else 'off'})", flush=True)
+    # Sim worker spawn is deferred until after hw_state shms are allocated
+    # (it bridges them when --robot-source sim). See below the hw_state
+    # block.
 
     def stop_sim() -> None:
         if sim["stop_ev"] is not None:
@@ -1112,13 +1080,17 @@ async def main_async(args) -> None:
             "last_error": hw_state["ctrl_error"],
             "configs":  hw_state.get("ctrl_configs", {}),
             "ee_target": _read_ee_target(),
-            "policy":   _read_policy_block() if args.robot_source == "hardware" else None,
+            "policy":   _read_policy_block() if args.robot_source in ("hardware", "sim") else None,
         }
 
     async def _broadcast_controller_state():
         await hub.broadcast(encode_controller_state(0, _broadcast_controller_state_sync()))
 
-    if args.robot_source == "hardware":
+    # Sim mode acts as a drop-in for hardware (same controller dispatcher,
+    # same shm protocol, same policy plumbing). The only difference is who
+    # runs the 500 Hz state-pub / torque-apply loop: the kortex transport
+    # process for real, or the MuJoCo sim worker (with bridge kwargs) for sim.
+    if args.robot_source in ("hardware", "sim"):
         from hardware import (
             transport_process,
             CMD_MODE_IDLE, CMD_MODE_TORQUE, CMD_MODE_POSITION,
@@ -1194,28 +1166,77 @@ async def main_async(args) -> None:
             log_q=log_q,
         )
 
-        transport_proc = mp.Process(
-            target=transport_process,
-            args=(args.robot_ip,),
-            kwargs={
-                "shm_q": shm_q, "shm_dq": shm_dq, "shm_state_seq": shm_state_seq,
-                "shm_cmd_mode": shm_cmd_mode, "shm_tau": shm_tau,
-                "shm_qtarget": shm_qtarget, "shm_gripper": shm_gripper,
-                "shm_cmd_seq": shm_cmd_seq,
-                "stop_ev": transport_stop,
-                "swap_request_ev": swap_request_ev,
-                "swap_target_mode": swap_target_mode,
-                "swap_done_ev": swap_done_ev,
-                "shm_hz": shm_hz, "shm_phase": shm_phase,
-                "shm_fault_msg": shm_fault_msg,
-                "log_q": log_q,
-            },
-            daemon=True,
-        )
-        transport_proc.start()
-        hw_state["transport_proc"] = transport_proc
-        print(f"[hw] transport process started (ip={args.robot_ip})",
-              flush=True)
+        if args.robot_source == "hardware":
+            transport_proc = mp.Process(
+                target=transport_process,
+                args=(args.robot_ip,),
+                kwargs={
+                    "shm_q": shm_q, "shm_dq": shm_dq, "shm_state_seq": shm_state_seq,
+                    "shm_cmd_mode": shm_cmd_mode, "shm_tau": shm_tau,
+                    "shm_qtarget": shm_qtarget, "shm_gripper": shm_gripper,
+                    "shm_cmd_seq": shm_cmd_seq,
+                    "stop_ev": transport_stop,
+                    "swap_request_ev": swap_request_ev,
+                    "swap_target_mode": swap_target_mode,
+                    "swap_done_ev": swap_done_ev,
+                    "shm_hz": shm_hz, "shm_phase": shm_phase,
+                    "shm_fault_msg": shm_fault_msg,
+                    "log_q": log_q,
+                },
+                daemon=True,
+            )
+            transport_proc.start()
+            hw_state["transport_proc"] = transport_proc
+            print(f"[hw] transport process started (ip={args.robot_ip})",
+                  flush=True)
+        else:
+            # Sim mode: spawn the sim_worker now with bridge kwargs so it
+            # owns the 500 Hz state-pub loop and accepts torque commands.
+            from sim import sim_worker, mj_camera_params
+            cam_pos, cam_quat, cam_fovy = mj_camera_params(sim_calib)
+            sim_stop_ev = mp.Event()
+            sim_proc = mp.Process(
+                target=sim_worker,
+                args=(args.mjcf, args.sim_camera),
+                kwargs={
+                    "rgb_shm_name": sess["shm"].rgb.name,
+                    "rgb_seq":      sess["shm"].rgb_seq,
+                    "rgb_w":        sim_calib.intrinsics.width,
+                    "rgb_h":        sim_calib.intrinsics.height,
+                    "qpos_arr":     robot["shm"].qpos,
+                    "qpos_seq":     robot["shm"].qpos_seq,
+                    "nq":           robot["shm"].nq,
+                    "ctrl_arr":     robot["ctrl_arr"],
+                    "ctrl_seq":     robot["ctrl_seq"],
+                    "nu":           robot["nu"],
+                    "cam_pos":      tuple(float(x) for x in cam_pos),
+                    "cam_quat_wxyz": tuple(float(x) for x in cam_quat),
+                    "cam_fovy_deg": float(cam_fovy),
+                    "depth_shm_name": sess["shm"].depth_stream.name,
+                    "rgbd_seq":       sess["shm"].rgbd_seq,
+                    "stop_ev":      sim_stop_ev,
+                    "open_viewer":  bool(args.mujoco_gui),
+                    # Hardware-bridge kwargs:
+                    "shm_q": shm_q, "shm_dq": shm_dq,
+                    "shm_state_seq": shm_state_seq,
+                    "shm_cmd_mode": shm_cmd_mode, "shm_tau": shm_tau,
+                    "shm_qtarget": shm_qtarget, "shm_gripper": shm_gripper,
+                    "shm_cmd_seq": shm_cmd_seq,
+                    "swap_request_ev": swap_request_ev,
+                    "swap_target_mode": swap_target_mode,
+                    "swap_done_ev": swap_done_ev,
+                    "shm_hz": shm_hz, "shm_phase": shm_phase,
+                    "shm_fault_msg": shm_fault_msg,
+                },
+                daemon=True,
+            )
+            sim_proc.start()
+            sim.update(proc=sim_proc, stop_ev=sim_stop_ev)
+            # Track in hw_state so stop_hardware() can stop it too.
+            hw_state["transport_proc"] = sim_proc
+            print(f"[sim] worker started (camera={args.sim_camera}, "
+                  f"viewer={'on' if args.mujoco_gui else 'off'}, "
+                  f"bridge=on)", flush=True)
 
         # The default 'idle' controller process gets spawned lazily by
         # on_set_controller — start it now so the dispatcher state is
@@ -1225,7 +1246,7 @@ async def main_async(args) -> None:
 
     async def on_set_controller(name: str) -> None:
         """SST: stop current controller → home robot → start new controller."""
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         from controllers import CONTROLLERS
         from hardware import CMD_MODE_IDLE, CMD_MODE_TORQUE, CMD_MODE_POSITION
@@ -1285,7 +1306,8 @@ async def main_async(args) -> None:
         log_q = hw_state.get("log_q")
         target_callable, ctrl_kwargs = (
             factory(mjcf_path=args.robot_arm_mjcf, log_q=log_q,
-                    shm_gains=hw_state["shm_gains"])
+                    shm_gains=hw_state["shm_gains"],
+                    robot_source=args.robot_source)
             if info.command_mode != "idle"
             else factory(log_q=log_q)
         )
@@ -1355,7 +1377,7 @@ async def main_async(args) -> None:
         cmd_seq is harmless for torque-mode controllers (they're already
         running at 500 Hz from state_seq) but matters for position mode.
         """
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         if hw_state["shm_qtarget"] is None or hw_state["shm_cmd_seq"] is None:
             return
@@ -1375,7 +1397,7 @@ async def main_async(args) -> None:
 
         Quaternion is normalised; degenerate input is rejected.
         """
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         if hw_state["shm_qtarget"] is None or hw_state["shm_cmd_seq"] is None:
             return
@@ -1404,7 +1426,7 @@ async def main_async(args) -> None:
         Layout follows _seed_gains: joint_pd packs kp[7]||kd[7], ee_pose
         uses scalars in slots 0..6.
         """
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         cfg = hw_state.setdefault("ctrl_configs", {}).setdefault(name, {})
         if name == "joint_pd":
@@ -1456,7 +1478,7 @@ async def main_async(args) -> None:
           (when the policy needs one)
         - the required controller can't be engaged
         """
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         from policies import POLICIES
 
@@ -1575,7 +1597,7 @@ async def main_async(args) -> None:
 
     async def on_stop_policy() -> None:
         """Stop the active policy and restore the user's ee_pose gains."""
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         if hw_state["policy_proc"] is None:
             return
@@ -1627,7 +1649,7 @@ async def main_async(args) -> None:
         kortex link gets a fresh connection; controller state is reset to
         idle.
         """
-        if args.robot_source != "hardware":
+        if args.robot_source not in ("hardware", "sim"):
             return
         print("[hw] restart_transport: stopping current controller…", flush=True)
         if hw_state["ctrl_stop"] is not None:
@@ -1758,7 +1780,7 @@ async def main_async(args) -> None:
             frames = [meta]
             if robot["enabled"] and robot["geom_payload"]:
                 frames.append(robot["geom_payload"])
-            if args.robot_source == "hardware":
+            if args.robot_source in ("hardware", "sim"):
                 frames.append(encode_controller_state(
                     0, _broadcast_controller_state_sync()))
             return frames
@@ -2058,8 +2080,8 @@ async def main_async(args) -> None:
                     "sam_ms":    sam_last_ms["v"],
                 }))
                 seq += 1
-                # Hardware mode: broadcast transport rate + phase + fault.
-                if args.robot_source == "hardware" and hw_state["shm_hz"] is not None:
+                # Hardware/sim mode: broadcast transport rate + phase + fault.
+                if args.robot_source in ("hardware", "sim") and hw_state["shm_hz"] is not None:
                     try:
                         with hw_state["shm_hz"].get_lock():
                             transport_hz = float(np.frombuffer(
@@ -2090,7 +2112,7 @@ async def main_async(args) -> None:
                         })
                     last_phase = phase
                     await hub.broadcast(encode_robot_status(seq, {
-                        "source":      "hardware",
+                        "source":      args.robot_source,
                         "osc_hz":      round(transport_hz, 1),
                         "alive":       transport_alive,
                         "phase":       phase,

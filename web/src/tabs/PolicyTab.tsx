@@ -27,7 +27,7 @@ const STATUS_LABELS: Record<number, string> = {
 
 export function PolicyTab({ stream }: Props) {
   const robot = stream.meta?.robot;
-  const isHardware = robot?.source === "hardware";
+  const isHardware = robot?.source === "hardware" || robot?.source === "sim";
   const pol = stream.controllerState?.policy;
 
   if (!isHardware) {
@@ -35,7 +35,8 @@ export function PolicyTab({ stream }: Props) {
       <div className="row">
         <div className="label">Policy</div>
         <div className="help">
-          Only available with <code>--robot-source hardware</code>.
+          Only available with <code>--robot-source hardware</code> or
+          <code>--robot-source sim</code>.
         </div>
       </div>
     );

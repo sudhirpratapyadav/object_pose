@@ -18,7 +18,7 @@ export function RobotTab({ stream }: Props) {
   const robotEnabled = !!robot?.enabled;
   const robotSrc = robot?.source ?? "none";
   const ctrl = stream.controllerState;
-  const isHardware = robotSrc === "hardware";
+  const isHardware = robotSrc === "hardware" || robotSrc === "sim";
 
   if (!robotEnabled) {
     return (
