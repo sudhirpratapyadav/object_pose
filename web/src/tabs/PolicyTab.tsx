@@ -1,18 +1,16 @@
 /**
- * Policy tab — engage / disengage a learned NN policy.
+ * Policy tab — pick a learned policy and control its lifecycle.
  *
- * A policy writes setpoints into shm_qtarget at its own outer-loop rate
- * (10 Hz for open_drawer). The active ee_pose controller tracks those
- * setpoints at 500 Hz.
+ * State machine (server-driven):
+ *   idle    — nothing selected, or selected but never engaged.
+ *   running — subprocess writing shm_qtarget at target_hz; ee_pose tracks.
+ *   paused  — selection kept, subprocess dead, arm holds at current pose.
  *
- * Engage flow (server-side):
- *   1. checks fresh object_pose if the policy needs one;
- *   2. overlays the policy's controller_gains on ee_pose for the run;
- *   3. hot-swaps to ee_pose if not already running;
- *   4. spawns the policy subprocess.
- *
- * UI shows: dropdown, status pill (waiting/running/success), object-pose
- * indicator, goal block, live HZ, and the last 7-D action.
+ * Buttons (one row, in order):
+ *   ▶ Play / ■ Stop   — toggle. Play: idle → running (needs object_pose).
+ *                       Stop: any → idle (drives home via SST).
+ *   ⏸ Pause / ▶ Resume — toggle. running ↔ paused.
+ *   ⟲ Reset           — drive home, leave selection in paused state.
  */
 
 import { StreamState } from "../useStream";
@@ -51,50 +49,34 @@ export function PolicyTab({ stream }: Props) {
   }
 
   const available = pol.available;
-  const current = pol.current || "";
-  const engaged = !!current;
+  const selected = pol.selected || "";
+  const running = pol.lifecycle === "running";
+  const paused  = pol.lifecycle === "paused";
+  const idle    = pol.lifecycle === "idle";
+  const hasSelection = !!selected;
   const statusLabel = STATUS_LABELS[pol.status_code] ?? `code=${pol.status_code}`;
 
-  const activeInfo = available.find((p) => p.name === current);
+  const activeInfo = available.find((p) => p.name === selected);
 
-  const onSelect = (name: string) => {
-    if (!name) return;
-    if (engaged && name === current) return;
-    if (engaged) stream.stopPolicy();
-    stream.setPolicy(name);
+  // Error is only meaningful once a policy is selected; otherwise the
+  // server's "select a policy first" / "no object_pose" messages are noise.
+  const errorVisible = hasSelection && !!pol.last_error;
+
+  const playOrStop = () => {
+    if (running || paused) stream.stopPolicy();
+    else stream.playPolicy();
   };
+  const pauseOrResume = () => stream.pausePolicy();
+  const reset = () => stream.resetPolicy();
 
   return (
     <>
       <div className="row">
-        <div className="label">Active policy</div>
-        <div className="kv mono" style={{ fontSize: "0.85em" }}>
-          <span>{engaged ? activeInfo?.display_name ?? current : "(none)"}</span>
-          <span className={
-            "kv-val " + (pol.status_code === 1 ? "ok"
-              : pol.status_code === 2 ? "ok"
-              : pol.status_code === 0 && engaged ? "warn"
-              : "")
-          }>
-            {engaged ? statusLabel : "—"}
-          </span>
-        </div>
-        {pol.last_error && (
-          <div className="help" style={{ color: "salmon" }}>
-            {pol.last_error}
-          </div>
-        )}
-        {activeInfo?.description && (
-          <div className="help">{activeInfo.description}</div>
-        )}
-      </div>
-
-      <div className="row">
-        <div className="label">Pick policy</div>
+        <div className="label">Select policy</div>
         <select
           className="select"
-          value={current}
-          onChange={(e) => onSelect(e.target.value)}
+          value={selected}
+          onChange={(e) => stream.selectPolicy(e.target.value)}
         >
           <option value="">(none)</option>
           {available.map((p) => (
@@ -103,49 +85,90 @@ export function PolicyTab({ stream }: Props) {
             </option>
           ))}
         </select>
-        <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-          <button
-            className="button"
-            onClick={() => stream.stopPolicy()}
-            disabled={!engaged}
-            title="Stop the active policy and restore the user's ee_pose gains"
-          >
-            Stop
-          </button>
-          <button
-            className="button"
-            onClick={() => stream.reloadPolicyConfigs()}
-            title="Re-read policies/configs.yaml from disk"
-          >
-            Reload configs
-          </button>
-        </div>
-      </div>
-
-      {/* Object-pose status — what the policy reads from vision */}
-      <div className="row">
-        <div className="label">Object pose</div>
-        {pol.object_pose ? (
-          <>
-            <div className="kv mono" style={{ fontSize: "0.85em" }}>
-              <span>handle (world)</span>
-              <span className="kv-val">
-                [{pol.object_pose.pos.map((v) => v.toFixed(3)).join(", ")}]
-              </span>
-            </div>
-            <div className="help">
-              {pol.object_pose.n_points} masked points
-            </div>
-          </>
-        ) : (
-          <div className="help" style={{ color: "salmon" }}>
-            no object pose — click the target in the RGB view to make a SAM mask
-          </div>
+        {activeInfo?.description && (
+          <div className="help">{activeInfo.description}</div>
         )}
       </div>
 
-      {/* Goal (set at engage time = handle + goal_offset) */}
-      {engaged && (
+      {/* Controls row — only shown once a policy is selected */}
+      {hasSelection && (
+        <div className="row">
+          <div className="label">Controls</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <button
+              className={"button " + (idle ? "accent" : "")}
+              onClick={playOrStop}
+              title={
+                running || paused ? "Disengage and drive home"
+                  : "Engage the selected policy"
+              }
+            >
+              {running || paused ? "■ Stop" : "▶ Play"}
+            </button>
+            {(running || paused) && (
+              <button
+                className="button"
+                onClick={pauseOrResume}
+                title={
+                  running ? "Pause: hold arm at current pose"
+                    : "Resume: continue from current pose"
+                }
+              >
+                {running ? "⏸ Pause" : "▶ Resume"}
+              </button>
+            )}
+            {(running || paused) && (
+              <button
+                className="button"
+                onClick={reset}
+                title="Drive home; selection remains, paused at home"
+              >
+                ⟲ Reset
+              </button>
+            )}
+          </div>
+          <div className="help">
+            State: <b>{pol.lifecycle}</b>
+            {running && <> · {statusLabel}</>}
+          </div>
+        </div>
+      )}
+
+      {/* Per-policy error — only meaningful once selected */}
+      {errorVisible && (
+        <div className="row">
+          <div className="help" style={{ color: "salmon" }}>
+            {pol.last_error}
+          </div>
+        </div>
+      )}
+
+      {/* Object-pose status — what the policy reads from vision */}
+      {hasSelection && activeInfo?.needs_object_pose && (
+        <div className="row">
+          <div className="label">Object pose</div>
+          {pol.object_pose ? (
+            <>
+              <div className="kv mono" style={{ fontSize: "0.85em" }}>
+                <span>handle (world)</span>
+                <span className="kv-val">
+                  [{pol.object_pose.pos.map((v) => v.toFixed(3)).join(", ")}]
+                </span>
+              </div>
+              <div className="help">
+                {pol.object_pose.n_points} masked points
+              </div>
+            </>
+          ) : (
+            <div className="help" style={{ color: "salmon" }}>
+              no object pose — click the target in the RGB view to make a SAM mask
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Goal (set at Play time = handle + goal_offset) */}
+      {(running || paused) && (
         <div className="row">
           <div className="label">Goal</div>
           <div className="kv mono" style={{ fontSize: "0.85em" }}>
@@ -158,7 +181,7 @@ export function PolicyTab({ stream }: Props) {
       )}
 
       {/* Live HZ + last action */}
-      {engaged && (
+      {running && (
         <div className="row">
           <div className="label">Live</div>
           <div className="kv mono" style={{ fontSize: "0.85em" }}>

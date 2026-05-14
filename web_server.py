@@ -174,7 +174,8 @@ async def handler(ws, hub: Hub, get_connect_frames,
                   on_set_ee_target,
                   on_set_controller_gains, on_save_controller_gains,
                   on_reload_controller_gains,
-                  on_set_policy, on_stop_policy,
+                  on_select_policy, on_play_policy, on_stop_policy,
+                  on_pause_policy, on_reset_policy,
                   on_save_policy_configs, on_reload_policy_configs) -> None:
     await hub.add(ws)
     try:
@@ -252,10 +253,16 @@ async def handler(ws, hub: Hub, get_connect_frames,
                     await on_save_controller_gains(n)
                 elif "reload_controller_gains" in cmd:
                     await on_reload_controller_gains()
-                elif "set_policy" in cmd:
-                    await on_set_policy(str(cmd["set_policy"]))
+                elif "select_policy" in cmd:
+                    await on_select_policy(str(cmd["select_policy"]))
+                elif "play_policy" in cmd:
+                    await on_play_policy()
                 elif "stop_policy" in cmd:
                     await on_stop_policy()
+                elif "pause_policy" in cmd:
+                    await on_pause_policy()
+                elif "reset_policy" in cmd:
+                    await on_reset_policy()
                 elif "save_policy_configs" in cmd:
                     await on_save_policy_configs()
                 elif "reload_policy_configs" in cmd:
@@ -1048,6 +1055,22 @@ async def main_async(args) -> None:
                     arr = np.frombuffer(hw_state["shm_object_pose"].get_obj(),
                                          dtype=np.float64)[:4].copy()
                 obj_pose = {"pos": arr[:3].tolist(), "n_points": int(arr[3])}
+        # Lifecycle state for the UI to decide which buttons to enable.
+        # Three explicit states:
+        #   idle    — nothing selected, OR selected but never Played in
+        #             this selection cycle. UI shows: Play.
+        #   running — subprocess alive. UI shows: Stop / Pause / Reset.
+        #   paused  — selection was Played, then Paused/Reset; subprocess
+        #             dead, arm holds in place. UI: Stop / Resume / Reset.
+        running_name = hw_state.get("policy_name", "") or ""
+        selected = hw_state.get("policy_selected", "") or ""
+        engaged_once = bool(hw_state.get("policy_engaged_once", False))
+        if running_name:
+            lifecycle = "running"
+        elif selected and engaged_once:
+            lifecycle = "paused"
+        else:
+            lifecycle = "idle"
         return {
             "available": [
                 {"name": info.name, "display_name": info.display_name,
@@ -1056,8 +1079,10 @@ async def main_async(args) -> None:
                  "needs_object_pose": info.needs_object_pose}
                 for (info, _) in POLICIES.values()
             ],
-            "current":     hw_state.get("policy_name", "") or "",
-            "status_code": status_code,        # 0 waiting, 1 running, 2 success
+            "selected":    selected,            # dropdown pick
+            "current":     running_name,        # actively running subprocess
+            "lifecycle":   lifecycle,           # "idle" | "paused" | "running"
+            "status_code": status_code,         # 0 waiting, 1 running, 2 success
             "last_error":  hw_state.get("policy_error", ""),
             "configs":     hw_state.get("pol_configs", {}),
             "hz":          round(hz, 1),
@@ -1155,8 +1180,21 @@ async def main_async(args) -> None:
             shm_policy_last_action=shm_policy_last_action,
             shm_policy_status=shm_policy_status,
             pol_configs=pol_configs,
-            # Policy run state (server-owned)
-            policy_name="",          # "" = no policy engaged
+            # Async mutex so concurrent UI clicks (Play during Stop, etc.)
+            # don't race. Each policy handler grabs it for its full
+            # transition.
+            policy_lock=asyncio.Lock(),
+            # Policy run state (server-owned).
+            # 'policy_selected'      = dropdown pick (UI focus). "" = none.
+            # 'policy_name'          = currently *running* policy. "" = paused.
+            # 'policy_engaged_once'  = whether Play was pressed in this
+            #                          selection cycle. Distinguishes a
+            #                          fresh selection (idle, show "Play")
+            #                          from a paused-after-running state
+            #                          (paused, show "Resume/Stop/Reset").
+            policy_selected="",
+            policy_engaged_once=False,
+            policy_name="",
             policy_proc=None,
             policy_stop=None,
             policy_error="",
@@ -1259,10 +1297,13 @@ async def main_async(args) -> None:
 
         info, factory = CONTROLLERS[name]
 
-        # --- 0. If a policy is running, stop it. It writes to shm_qtarget;
-        #         keeping it alive across an SST would race with the swap.
+        # --- 0. If a policy is running, kill its subprocess. The SST is
+        #         about to drive home; a live policy writing shm_qtarget
+        #         would race with the swap. We keep policy_selected so
+        #         the UI shows it's still in policy mode; the policy
+        #         handler will re-spawn / restore gains as appropriate.
         if hw_state.get("policy_proc") is not None:
-            await on_stop_policy()
+            await _kill_policy()
 
         # --- 1. Stop current controller ---
         hw_state["ctrl_status"] = "stopping"
@@ -1471,89 +1512,91 @@ async def main_async(args) -> None:
         await _broadcast_controller_state()
 
     # ── Policies ──────────────────────────────────────────────────────────
-    async def on_set_policy(name: str) -> None:
-        """Engage a policy by name. Refuses if:
-        - no policy entry exists in policies/configs.yaml
-        - the active camera + SAM aren't producing a fresh object_pose
-          (when the policy needs one)
-        - the required controller can't be engaged
+    # Policy lifecycle (server state):
+    #   idle    : nothing engaged. policy_selected may be set (user picked
+    #             from dropdown but hasn't pressed Play yet).
+    #   running : subprocess alive, writing shm_qtarget at target_hz.
+    #   paused  : subprocess dead, shm_qtarget seeded to current FK so the
+    #             active ee_pose controller holds the arm in place.
+    #
+    # Commands:
+    #   select_policy(name)  — pick from dropdown. No engage.
+    #   play_policy()        — idle -> running. Needs object_pose if the
+    #                          selected policy requires one.
+    #   stop_policy()        — running/paused -> idle. Drives home (SST).
+    #   pause_policy()       — running -> paused (toggle: resume from paused).
+    #   reset_policy()       — drive home, leave selection as paused.
+    def _read_object_pose() -> tuple[np.ndarray, int, int]:
+        with hw_state["shm_object_pose_seq"].get_lock():
+            seq = int(hw_state["shm_object_pose_seq"].value)
+        with hw_state["shm_object_pose"].get_lock():
+            obj = np.frombuffer(hw_state["shm_object_pose"].get_obj(),
+                                 dtype=np.float64)[:4].copy()
+        return obj[:3], int(obj[3]), seq
+
+    def _read_current_ee_pose() -> tuple[np.ndarray, np.ndarray] | None:
+        """Return (pos, quat_xyzw) of the EE right now, via FK."""
+        if hw_state.get("shm_q") is None:
+            return None
+        try:
+            from hardware import PinocchioArm
+            arm = PinocchioArm(args.robot_arm_mjcf, ee_frame="pinch_site")
+        except Exception:
+            return None
+        with hw_state["shm_q"].get_lock():
+            q = np.frombuffer(hw_state["shm_q"].get_obj(),
+                              dtype=np.float64)[:7].copy()
+        pos, R = arm.fk(q)
+        from controllers.ee_pose import _quat_xyzw_from_matrix
+        return pos, _quat_xyzw_from_matrix(R)
+
+    def _seed_qtarget_to_current() -> None:
+        """Write the current FK pose into shm_qtarget so the ee_pose
+        controller holds the arm exactly where it is now."""
+        ee = _read_current_ee_pose()
+        if ee is None:
+            return
+        pos, quat = ee
+        with hw_state["shm_qtarget"].get_lock():
+            arr = np.frombuffer(hw_state["shm_qtarget"].get_obj(),
+                                dtype=np.float64)
+            arr[0:3] = pos
+            arr[3:7] = quat
+        with hw_state["shm_cmd_seq"].get_lock():
+            hw_state["shm_cmd_seq"].value = (
+                hw_state["shm_cmd_seq"].value + 1) & 0xFFFFFFFF
+
+    async def _spawn_policy(name: str) -> bool:
+        """Spawn the policy subprocess for `name`. Returns True on success.
+
+        Assumes the caller already ensured the required controller is
+        running and the policy_selected gains are overlaid on ee_pose.
+        Object_pose / goal recomputation happens here so re-spawning
+        (Resume) picks up the latest mask.
         """
-        if args.robot_source not in ("hardware", "sim"):
-            return
         from policies import POLICIES
-
-        if name not in POLICIES:
-            err = f"unknown policy '{name}'"
-            print(f"[pol] {err}", flush=True)
-            hw_state["policy_error"] = err
-            await _broadcast_controller_state()
-            return
         info, factory = POLICIES[name]
-        cfg = hw_state["pol_configs"].get(name, {})
-        if not cfg:
-            err = f"no config for '{name}' in policies/configs.yaml"
-            print(f"[pol] {err}", flush=True)
-            hw_state["policy_error"] = err
-            await _broadcast_controller_state()
-            return
+        cfg = hw_state["pol_configs"][name]
 
-        # Block on fresh object_pose if needed.
+        # Recompute goal from latest object_pose if the policy needs it.
         if info.needs_object_pose:
-            with hw_state["shm_object_pose_seq"].get_lock():
-                seq = int(hw_state["shm_object_pose_seq"].value)
-            with hw_state["shm_object_pose"].get_lock():
-                obj = np.frombuffer(hw_state["shm_object_pose"].get_obj(),
-                                     dtype=np.float64)[:4].copy()
-            if seq == 0 or obj[3] < 10:
-                err = ("no object_pose available — click the target object "
-                       "in the RGB view to produce a SAM mask first")
-                print(f"[pol] refusing engage: {err}", flush=True)
+            handle, n_pts, seq = _read_object_pose()
+            if seq == 0 or n_pts < 10:
+                err = (f"'{name}' needs an object_pose — click the target "
+                       f"object in the RGB view to produce a SAM mask first")
+                print(f"[pol] {err}", flush=True)
                 hw_state["policy_error"] = err
-                await _broadcast_controller_state()
-                return
-            handle_world = obj[:3].copy()
-        else:
-            handle_world = np.zeros(3)
+                return False
+            goal_offset = np.asarray(cfg.get("goal_offset", [0, 0, 0]),
+                                      dtype=np.float64)
+            goal_world = handle + goal_offset
+            with hw_state["shm_policy_goal"].get_lock():
+                np.frombuffer(hw_state["shm_policy_goal"].get_obj(),
+                              dtype=np.float64)[:3] = goal_world
+            print(f"[pol] goal_world = {goal_world.round(3)}", flush=True)
 
-        # Stop any prior policy first.
-        if hw_state["policy_proc"] is not None:
-            await on_stop_policy()
-
-        # Snapshot the user's saved ee_pose gains so we can restore.
-        saved = hw_state["ctrl_configs"].get(info.controller, {}).copy()
-        hw_state["saved_ee_pose_gains"] = saved
-
-        # Overlay the policy's controller_gains onto the ee_pose config
-        # and re-seed shm_gains. This affects the *active* controller
-        # immediately and will persist as long as the policy runs.
-        pol_gains = cfg.get("controller_gains", {})
-        new_ctrl_cfg = saved.copy()
-        new_ctrl_cfg.update(pol_gains)
-        hw_state["ctrl_configs"][info.controller] = new_ctrl_cfg
-
-        # If the required controller isn't already running, hot-swap to it.
-        # The hot-swap goes through home anyway. After the swap, we'll
-        # re-issue a JointMove to the policy's home_deg if it differs.
-        if hw_state["ctrl_name"] != info.controller:
-            await on_set_controller(info.controller)
-        else:
-            # Same controller — push the overlay into shm now.
-            _seed_gains(hw_state["shm_gains"], info.controller, new_ctrl_cfg)
-            await _broadcast_controller_state()
-
-        # TODO: per-policy home_deg JointMove. Today we use the default
-        # HOME_DEG inside the SST. If policy's home differs significantly
-        # the user can manually drag the EE gizmo near it first, OR we
-        # add a TCP path here to JointMove to policy.home_deg before
-        # spawning. Left as a follow-up to keep this slice scoped.
-
-        # Compute and store goal pose = handle + offset (world frame).
-        goal_offset = np.asarray(cfg.get("goal_offset", [0, 0, 0]), dtype=np.float64)
-        goal_world = handle_world + goal_offset
-        with hw_state["shm_policy_goal"].get_lock():
-            np.frombuffer(hw_state["shm_policy_goal"].get_obj(),
-                          dtype=np.float64)[:3] = goal_world
-        # Reset stats.
+        # Reset stats so the UI doesn't show stale numbers from the
+        # previous run.
         with hw_state["shm_policy_hz"].get_lock():
             np.frombuffer(hw_state["shm_policy_hz"].get_obj(),
                           dtype=np.float64)[0] = 0.0
@@ -1563,12 +1606,7 @@ async def main_async(args) -> None:
         with hw_state["shm_policy_status"].get_lock():
             np.frombuffer(hw_state["shm_policy_status"].get_obj(),
                           dtype=np.uint8)[0] = 0
-        # Also re-zero object_pose_seq so the policy waits for a fresh
-        # frame before producing actions.
-        # (Don't zero shm_object_pose itself — keep the latest position
-        # so engage gripper handling is smooth.)
 
-        # Spawn the policy subprocess.
         target, kwargs = factory(
             mjcf_path=args.robot_arm_mjcf, cfg=cfg,
             log_q=hw_state.get("log_q"),
@@ -1592,17 +1630,12 @@ async def main_async(args) -> None:
         hw_state["policy_proc"]  = proc
         hw_state["policy_stop"]  = stop_ev
         hw_state["policy_error"] = ""
-        print(f"[pol] running '{name}'  goal_world={goal_world.round(3)}", flush=True)
-        await _broadcast_controller_state()
+        print(f"[pol] running '{name}'", flush=True)
+        return True
 
-    async def on_stop_policy() -> None:
-        """Stop the active policy and restore the user's ee_pose gains."""
-        if args.robot_source not in ("hardware", "sim"):
-            return
-        if hw_state["policy_proc"] is None:
-            return
-        name = hw_state["policy_name"]
-        print(f"[pol] stopping '{name}'", flush=True)
+    async def _kill_policy() -> None:
+        """Kill the policy subprocess if alive. Doesn't touch selection
+        or restore gains. Caller decides what to do next."""
         if hw_state["policy_stop"] is not None:
             hw_state["policy_stop"].set()
         if hw_state["policy_proc"] is not None:
@@ -1614,15 +1647,161 @@ async def main_async(args) -> None:
         hw_state["policy_stop"] = None
         hw_state["policy_name"] = ""
 
-        # Restore the saved ee_pose gains so the controller goes back to
-        # the user's interactive tuning. Only restore if we did snapshot.
+    def _overlay_policy_gains(name: str) -> None:
+        """Snapshot the user's ee_pose gains and overlay this policy's
+        controller_gains for the duration of the run."""
+        from policies import POLICIES
+        info, _ = POLICIES[name]
+        cfg = hw_state["pol_configs"][name]
+        if hw_state.get("saved_ee_pose_gains") is None:
+            hw_state["saved_ee_pose_gains"] = \
+                hw_state["ctrl_configs"].get(info.controller, {}).copy()
+        pol_gains = cfg.get("controller_gains", {})
+        new_ctrl_cfg = hw_state["saved_ee_pose_gains"].copy()
+        new_ctrl_cfg.update(pol_gains)
+        hw_state["ctrl_configs"][info.controller] = new_ctrl_cfg
+        if hw_state["ctrl_name"] == info.controller:
+            _seed_gains(hw_state["shm_gains"], info.controller, new_ctrl_cfg)
+
+    def _restore_user_gains() -> None:
+        """Restore the user's ee_pose gains if we overlaid policy gains."""
         saved = hw_state.get("saved_ee_pose_gains")
-        if saved is not None:
-            hw_state["ctrl_configs"]["ee_pose"] = saved
-            if hw_state["ctrl_name"] == "ee_pose":
-                _seed_gains(hw_state["shm_gains"], "ee_pose", saved)
-            hw_state["saved_ee_pose_gains"] = None
-        await _broadcast_controller_state()
+        if saved is None:
+            return
+        hw_state["ctrl_configs"]["ee_pose"] = saved
+        if hw_state["ctrl_name"] == "ee_pose":
+            _seed_gains(hw_state["shm_gains"], "ee_pose", saved)
+        hw_state["saved_ee_pose_gains"] = None
+
+    async def on_select_policy(name: str) -> None:
+        """Set the currently selected policy (UI dropdown). No engage.
+
+        Switching selection resets the engaged-once flag — a fresh
+        selection is always "idle" (Play button), even if a previous
+        policy was running.
+        """
+        if args.robot_source not in ("hardware", "sim"):
+            return
+        async with hw_state["policy_lock"]:
+            from policies import POLICIES
+            if name and name not in POLICIES:
+                err = f"unknown policy '{name}'"
+                print(f"[pol] {err}", flush=True)
+                hw_state["policy_error"] = err
+                await _broadcast_controller_state()
+                return
+            # Same selection, no-op (don't reset engaged_once).
+            if name == hw_state.get("policy_selected", ""):
+                return
+            # Switching selection while running/paused: tear it down so the
+            # next Play starts fresh, and restore user gains.
+            if hw_state["policy_proc"] is not None:
+                await _kill_policy()
+            _restore_user_gains()
+            hw_state["policy_selected"] = name
+            hw_state["policy_engaged_once"] = False
+            hw_state["policy_error"] = ""
+            await _broadcast_controller_state()
+
+    async def on_play_policy() -> None:
+        """Engage the selected policy. idle -> running."""
+        if args.robot_source not in ("hardware", "sim"):
+            return
+        async with hw_state["policy_lock"]:
+            name = hw_state.get("policy_selected", "")
+            if not name:
+                hw_state["policy_error"] = "select a policy first"
+                await _broadcast_controller_state()
+                return
+            if hw_state["policy_proc"] is not None:
+                return  # already running
+            from policies import POLICIES
+            info, _ = POLICIES[name]
+
+            # Overlay gains BEFORE the controller swap so the new
+            # controller boots with the right gains.
+            _overlay_policy_gains(name)
+
+            # If the required controller isn't running, hot-swap to it.
+            if hw_state["ctrl_name"] != info.controller:
+                await on_set_controller(info.controller)
+
+            ok = await _spawn_policy(name)
+            if ok:
+                hw_state["policy_engaged_once"] = True
+            else:
+                _restore_user_gains()
+            await _broadcast_controller_state()
+
+    async def on_stop_policy() -> None:
+        """Disengage. Drive home. Selection is KEPT so the user can Play
+        again without re-picking. {running, paused} -> idle (for the
+        selected policy).
+        """
+        if args.robot_source not in ("hardware", "sim"):
+            return
+        async with hw_state["policy_lock"]:
+            # Kill subprocess if alive.
+            if hw_state["policy_proc"] is not None:
+                await _kill_policy()
+            _restore_user_gains()
+            hw_state["policy_engaged_once"] = False  # reset to idle state
+            hw_state["policy_error"] = ""
+            # Drive home via the SST: swap to idle so the arm parks safely.
+            await on_set_controller("idle")
+
+    async def on_pause_policy() -> None:
+        """Toggle: running -> paused (kill subprocess, hold at current pose).
+        paused -> running (re-spawn subprocess from current pose).
+        Pause is only meaningful after a previous Play.
+        """
+        if args.robot_source not in ("hardware", "sim"):
+            return
+        async with hw_state["policy_lock"]:
+            name = hw_state.get("policy_selected", "")
+            if not name or not hw_state.get("policy_engaged_once"):
+                return
+            if hw_state["policy_proc"] is not None:
+                # running -> paused
+                await _kill_policy()
+                _seed_qtarget_to_current()  # arm holds where it is now
+                print(f"[pol] paused '{name}'", flush=True)
+            else:
+                # paused -> running. Need the required controller alive.
+                from policies import POLICIES
+                info, _ = POLICIES[name]
+                if hw_state["ctrl_name"] != info.controller:
+                    _overlay_policy_gains(name)
+                    await on_set_controller(info.controller)
+                await _spawn_policy(name)
+            await _broadcast_controller_state()
+
+    async def on_reset_policy() -> None:
+        """Drive home via the SST, then sit paused. Selection is kept.
+        Only meaningful after a previous Play.
+        """
+        if args.robot_source not in ("hardware", "sim"):
+            return
+        async with hw_state["policy_lock"]:
+            name = hw_state.get("policy_selected", "")
+            if not name or not hw_state.get("policy_engaged_once"):
+                return
+            # Kill subprocess if alive — we don't want it writing targets
+            # during the swap.
+            if hw_state["policy_proc"] is not None:
+                await _kill_policy()
+            # Bounce through idle so the SST drives home. Then re-engage the
+            # required controller, but DON'T re-spawn the policy.
+            from policies import POLICIES
+            info, _ = POLICIES[name]
+            await on_set_controller("idle")
+            # Re-overlay gains and bring up the controller again.
+            _overlay_policy_gains(name)
+            await on_set_controller(info.controller)
+            # Seed qtarget to current (home) FK so the arm holds at home.
+            _seed_qtarget_to_current()
+            print(f"[pol] reset done — paused at home, selection='{name}'", flush=True)
+            await _broadcast_controller_state()
 
     async def on_save_policy_configs() -> None:
         from policies.configs import save_configs as save_pol_cfg
@@ -1799,7 +1978,8 @@ async def main_async(args) -> None:
                 on_set_ee_target,
                 on_set_controller_gains, on_save_controller_gains,
                 on_reload_controller_gains,
-                on_set_policy, on_stop_policy,
+                on_select_policy, on_play_policy, on_stop_policy,
+                on_pause_policy, on_reset_policy,
                 on_save_policy_configs, on_reload_policy_configs,
             ),
             args.host, args.port,
@@ -1997,7 +2177,7 @@ async def main_async(args) -> None:
                     seq += 1
                     # ── Object pose (centroid of masked points, world frame) ──
                     # Updated every depth frame; the policy reads it via shm.
-                    if (args.robot_source == "hardware"
+                    if (args.robot_source in ("hardware", "sim")
                             and hw_state.get("shm_object_pose") is not None):
                         pos_w, n_in = compute_object_pose(
                             seg_mask, pc_xyz_snap, pc_idx_snap, T_wc, n,

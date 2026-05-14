@@ -24,7 +24,7 @@ const KD_MIN = 0, KD_MAX = 20;
 
 export function JointPdPanel({ stream }: Props) {
   const robot = stream.meta?.robot;
-  const isHardware = robot?.source === "hardware";
+  const isHardware = robot?.source === "hardware" || robot?.source === "sim";
   const ctrl = stream.controllerState;
   const isActive = ctrl?.current === "joint_pd" && ctrl?.status === "running";
 

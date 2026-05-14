@@ -300,7 +300,16 @@ def sim_worker(
                             mujoco.mj_forward(model, data)
                     data.ctrl[:n_arm] = 0.0
                 else:  # CMD_MODE_IDLE
-                    data.ctrl[:n_arm] = 0.0
+                    # On real hardware "idle" means high-level position
+                    # servoing — the firmware holds the last pose. In sim
+                    # we mimic this with gravity compensation so the arm
+                    # doesn't drop under its own weight. mj_rne with
+                    # flg_acc=0 computes the bias forces (gravity +
+                    # Coriolis) needed to hold qvel at its current value;
+                    # we apply those as torque ctrl.
+                    qfrc = np.zeros(model.nv)
+                    mujoco.mj_rne(model, data, 0, qfrc)
+                    data.ctrl[:n_arm] = qfrc[:n_arm]
 
             else:
                 # Legacy position-mode bridge (no robot-source=sim).

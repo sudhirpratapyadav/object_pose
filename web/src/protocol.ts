@@ -181,7 +181,9 @@ export type ObjectPose = {
 
 export type PolicyState = {
   available: PolicyInfo[];
-  current: string;                 // "" if no policy engaged
+  selected: string;                // dropdown pick; "" if nothing selected
+  current: string;                 // running subprocess; "" if not running
+  lifecycle: "idle" | "paused" | "running";
   status_code: number;             // 0 waiting, 1 running, 2 success
   last_error: string;
   configs: Record<string, Record<string, unknown>>;

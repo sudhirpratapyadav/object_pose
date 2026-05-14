@@ -28,7 +28,8 @@ export function StatusBar({ stream }: Props) {
     return "status-pill-warn";   // boot / homing / swapping
   })();
 
-  const isHardware = robotSrc === "hardware";
+  // Sim and hardware both have the controller dispatcher + transport.
+  const isHardware = robotSrc === "hardware" || robotSrc === "sim";
   const ctrlAvailable = ctrl?.available ?? [];
   const ctrlCurrent = ctrl?.current ?? "idle";
   const ctrlStatus = ctrl?.status ?? "idle";
@@ -41,17 +42,11 @@ export function StatusBar({ stream }: Props) {
   };
 
   const onStop = () => {
-    if (!isHardware) {
-      alert("STOP only works in hardware mode.");
-      return;
-    }
+    if (!isHardware) return;
     stream.stopController();
   };
   const onHome = () => {
-    if (!isHardware) {
-      alert("HOME only works in hardware mode.");
-      return;
-    }
+    if (!isHardware) return;
     stream.homeRobot();
   };
 
