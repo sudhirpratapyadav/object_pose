@@ -15,7 +15,10 @@ joint_pd:
   kd: [4.0,  4.0,  4.0,  3.0,  2.0,  1.0, 0.5]
 
 ee_pose:
-  # OSC torque tracking. (Hardcoded today; YAML wiring lands later.)
+  # OSC torque tracking. Read from shm_gains every cycle, so a
+  # per-policy overlay (e.g. open_drawer's stiffer kp=50) takes effect
+  # while the policy is running and restores to these values on stop.
+  # Conservative defaults: compliant interactive use (push the arm).
   kp_pos: 5.0
   kd_pos: 0.0
   kp_ori: 1.0

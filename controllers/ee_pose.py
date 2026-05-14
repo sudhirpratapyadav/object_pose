@@ -92,6 +92,10 @@ def ee_pose_controller_process(
     ee_frame: str = "pinch_site",
     log_q=None,
     apply_tau_offsets: bool = True,   # hardware bias correction; off in sim
+    shm_gains=None,   # mp.Array('d', 14) — overlaid by the dispatcher with
+                      # per-controller / per-policy gains. Slots 0..6 used:
+                      # [kp_pos, kd_pos, kp_ori, kd_ori,
+                      #  posture_kp, posture_kd, posture_weight]
 ):
     """OSC torque controller. Tracks shm_qtarget = [pos, quat_xyzw]."""
     from hardware.log_relay import install_log_relay
@@ -101,7 +105,10 @@ def ee_pose_controller_process(
     log.info(f"loading PinocchioArm({mjcf_path})…")
     arm = PinocchioArm(mjcf_path, ee_frame=ee_frame)
     posture = kinova_deg_to_rad(HOME_DEG)
-    log.info("ready (gains hardcoded; UI comes in slice 4.5+)")
+    if shm_gains is None:
+        log.info(f"ready (gains hardcoded: {GAINS})")
+    else:
+        log.info("ready (reading gains from shm_gains every cycle)")
 
     # Seed shm_qtarget = current EE pose so first iteration tracks itself.
     # Wait for at least one fresh state from the transport.
@@ -150,9 +157,25 @@ def ee_pose_controller_process(
         tgt_pos = tgt[:3]
         tgt_quat_xyzw = tgt[3:]
 
+        # Pull gains from shm if the dispatcher wired it; otherwise fall
+        # back to the compliant interactive defaults.
+        if shm_gains is None:
+            gains = GAINS
+        else:
+            with shm_gains.get_lock():
+                ga = _np_arr(shm_gains)[:7].copy()
+            gains = {
+                "kp_pos":         float(ga[0]),
+                "kd_pos":         float(ga[1]),
+                "kp_ori":         float(ga[2]),
+                "kd_ori":         float(ga[3]),
+                "posture_kp":     float(ga[4]),
+                "posture_kd":     float(ga[5]),
+                "posture_weight": float(ga[6]),
+            }
         try:
             tau = compute_osc_torques(arm, tgt_pos, tgt_quat_xyzw, q, dq,
-                                      gains=GAINS, posture_target=posture)
+                                      gains=gains, posture_target=posture)
         except Exception as exc:
             log.exception(f"OSC failed: {exc}")
             tau = np.zeros(7)

@@ -49,13 +49,14 @@ def _joint_pd_factory(*, mjcf_path: str, log_q=None,
 def _ee_pose_factory(*, mjcf_path: str, log_q=None,
                      shm_gains=None, robot_source: str = "hardware",
                      **_unused) -> tuple[Callable, dict]:
-    # ee_pose doesn't yet read shm_gains (gains hardcoded); kwarg is
-    # accepted for uniformity with the dispatcher.
-    del shm_gains
     return ee_pose_controller_process, {
         "mjcf_path": mjcf_path,
         "ee_frame":  "pinch_site",
         "log_q":     log_q,
+        # ee_pose reads gains from shm_gains every cycle so a per-policy
+        # overlay (open_drawer wants kp=50 vs. our default kp=5) takes
+        # effect immediately when engaged.
+        "shm_gains": shm_gains,
         # Real-robot joint bias correction stays on for hardware, off for
         # sim (sim dynamics are symmetric, no bias needed).
         "apply_tau_offsets": robot_source == "hardware",
