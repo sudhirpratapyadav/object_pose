@@ -1105,7 +1105,22 @@ async def main_async(args) -> None:
             "last_error": hw_state["ctrl_error"],
             "configs":  hw_state.get("ctrl_configs", {}),
             "ee_target": _read_ee_target(),
+            "ee_pose":   _read_ee_pose_payload(),
             "policy":   _read_policy_block() if args.robot_source in ("hardware", "sim") else None,
+        }
+
+    def _read_ee_pose_payload() -> dict | None:
+        """Current pinch_site pose in world frame, for the EE axes viewer.
+        Independent of the robot mesh: the axes draw at this pose even
+        when the robot is hidden.
+        """
+        ee = _read_current_ee_pose()
+        if ee is None:
+            return None
+        pos, quat = ee
+        return {
+            "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+            "quat_xyzw": [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
         }
 
     async def _broadcast_controller_state():
@@ -1545,15 +1560,24 @@ async def main_async(args) -> None:
                                  dtype=np.float64)[:4].copy()
         return obj[:3], int(obj[3]), seq
 
+    # Lazy/cached Pinocchio arm so the broadcast helpers don't reload the
+    # MJCF every tick. Use a dict so we can stash the instance from inside
+    # the helper.
+    _ee_fk_cache: dict = {"arm": None}
+
     def _read_current_ee_pose() -> tuple[np.ndarray, np.ndarray] | None:
-        """Return (pos, quat_xyzw) of the EE right now, via FK."""
+        """Return (pos, quat_xyzw) of the pinch_site (between gripper
+        fingers) right now, via FK on the live joint angles."""
         if hw_state.get("shm_q") is None:
             return None
-        try:
-            from hardware import PinocchioArm
-            arm = PinocchioArm(args.robot_arm_mjcf, ee_frame="pinch_site")
-        except Exception:
-            return None
+        arm = _ee_fk_cache["arm"]
+        if arm is None:
+            try:
+                from hardware import PinocchioArm
+                arm = PinocchioArm(args.robot_arm_mjcf, ee_frame="pinch_site")
+                _ee_fk_cache["arm"] = arm
+            except Exception:
+                return None
         with hw_state["shm_q"].get_lock():
             q = np.frombuffer(hw_state["shm_q"].get_obj(),
                               dtype=np.float64)[:7].copy()
@@ -1611,7 +1635,7 @@ async def main_async(args) -> None:
         # Recompute goal from latest object_pose if the policy needs it.
         if info.needs_object_pose:
             handle, n_pts, seq = _read_object_pose()
-            if seq == 0 or n_pts < 10:
+            if seq == 0 or n_pts < 3:
                 err = (f"'{name}' needs an object_pose — click the target "
                        f"object in the RGB view to produce a SAM mask first")
                 print(f"[pol] {err}", flush=True)

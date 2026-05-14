@@ -205,6 +205,9 @@ export type ControllerState = {
   // null otherwise. The browser uses this to seed/refresh the EE-target
   // gizmo when it's not actively being dragged.
   ee_target?: EeTarget | null;
+  // Current EE pose (pinch_site between gripper fingers, world frame).
+  // Computed via FK on shm_q. Used by the EE-axes viewer.
+  ee_pose?: EeTarget | null;
   // Policy block — present in hardware mode, null otherwise.
   policy?: PolicyState | null;
 };

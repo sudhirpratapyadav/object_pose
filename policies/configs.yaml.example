@@ -16,10 +16,8 @@ open_drawer:
   target_hz: 10
 
   # Home pose used at engage time (Kinova-deg convention).
-  # Training used joint_1=0° (arm pointing toward +x in robot frame), but
-  # our real installation has the workspace 90° clockwise — so we flip
-  # joint_1 to match. The remaining six joints are unchanged from training.
-  home_deg: [90.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0]
+  # Must match what the policy was trained from.
+  home_deg: [0.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0]
 
   # OSC gains for the ee_pose controller while this policy is engaged.
   # Restored to the user's saved ee_pose gains when the policy stops.

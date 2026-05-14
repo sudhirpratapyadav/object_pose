@@ -26,7 +26,11 @@ OSC_SUBS  = OSC_HZ // TARGET_HZ
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MAX_JOINT_TORQUE = np.array([39.0, 39.0, 39.0, 39.0, 9.0, 9.0, 9.0])
 TAU_OFFSETS      = np.array([0.0, 0.0, -0.5, 0.0, 0.0, 1.0, 0.0])
-HOME_DEG         = np.array([90.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0])
+# Universal home pose (Kinova-deg). joint_1=0° points the arm along the
+# robot's +x axis. Matches the open_drawer training home and the physical
+# workspace install on this machine. A previous default of joint_1=90°
+# caused the boot-time JointMove to abort when the arm sat near 0°.
+HOME_DEG         = np.array([0.0, 30.0, 0.0, 90.0, 0.0, 60.0, -90.0])
 
 GAINS_KEYS = ["kp_pos", "kd_pos", "kp_ori", "kd_ori",
               "posture_kp", "posture_kd", "posture_weight"]

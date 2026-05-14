@@ -201,7 +201,7 @@ def open_drawer_policy_process(
         # If we lost the object pose (e.g. mask disappeared), freeze
         # action to zero and wait. The transport keeps the last target,
         # so the arm holds in place.
-        if obj_seq == 0 or obj[3] < 10:   # need ≥10 masked points
+        if obj_seq == 0 or obj[3] < 3:   # need ≥3 masked points
             log.warning("waiting for object_pose (mask gone?); pausing policy")
             with shm_policy_status.get_lock():
                 _np_arr_bool(shm_policy_status)[0] = 0

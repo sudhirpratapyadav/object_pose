@@ -97,6 +97,15 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
     scene.add(robot.root);
     let lastRobotGeomSeq = -1, lastRobotXformSeq = -1;
 
+    // EE axes (live): independent of the robot mesh — drawn at
+    // pinch_site (point between gripper fingers), driven by
+    // controller_state.ee_pose each frame. Shown even when the robot
+    // mesh is hidden.
+    const eeLiveAxes = new THREE.AxesHelper(0.12);
+    eeLiveAxes.name = "ee-live-axes";
+    eeLiveAxes.visible = false;
+    scene.add(eeLiveAxes);
+
     // Bounding box for the segmented region.
     // Bbox lines: build from raw vertices each time mask updates. Box3Helper's
     // geometry doesn't refresh when the underlying Box3 mutates, so we own the
@@ -672,7 +681,22 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
         robot.setTransforms(rx.xpos, rx.xquat, rx.nbody);
       }
       robot.setVisible(propsRef.current.showRobot);
-      robot.setEeAxesVisible(propsRef.current.showEeAxes);
+      // Suppress the robot-tree EE axes (parented under the mesh, so they
+      // inherit showRobot). We draw scene-level EE axes from ee_pose
+      // instead — independent of the robot mesh visibility.
+      robot.setEeAxesVisible(false);
+      // Update the scene-level EE axes from the live ee_pose broadcast.
+      const eePose = streamRef.current.controllerState?.ee_pose;
+      if (eePose) {
+        eeLiveAxes.position.set(eePose.pos[0], eePose.pos[1], eePose.pos[2]);
+        eeLiveAxes.quaternion.set(
+          eePose.quat_xyzw[0], eePose.quat_xyzw[1],
+          eePose.quat_xyzw[2], eePose.quat_xyzw[3],
+        );
+        eeLiveAxes.visible = propsRef.current.showEeAxes;
+      } else {
+        eeLiveAxes.visible = false;
+      }
 
       // Animate the click-feedback ping (grow + fade over 400ms).
       if (ping.visible) {
@@ -726,6 +750,8 @@ export function Viewer({ stream, pointSize, inversePerspective, display, showCam
       pingGeom.dispose();
       pingMat.dispose();
       robot.dispose();
+      scene.remove(eeLiveAxes);
+      eeLiveAxes.dispose();
       container.removeChild(renderer.domElement);
     };
     // We intentionally only run this effect once; values are read via refs/closure

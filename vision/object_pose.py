@@ -18,7 +18,10 @@ from __future__ import annotations
 import numpy as np
 
 
-MIN_POINTS = 10   # below this, the mask is too sparse to trust
+# Minimum mask coverage to compute a centroid. A SAM mask on a small
+# object (drawer handle ~5x2 cm) can give just a handful of points after
+# downsampling — lower this if you find centroids aren't being published.
+MIN_POINTS = 3
 
 
 def compute_object_pose(
@@ -32,8 +35,8 @@ def compute_object_pose(
 
     ``pos_world`` is the centroid of all points that fall inside the
     SAM mask, transformed into the world frame. ``n_inside`` is the count
-    of masked points used.  If too few points (< MIN_POINTS), returns
-    (zeros, 0) — callers should treat that as "no fresh estimate".
+    of masked points used. Returns (zeros, 0) if no valid centroid can
+    be computed (mask empty or n_inside below MIN_POINTS).
     """
     if n_valid <= 0 or seg_mask is None or pc_xyz is None or pc_grid_idx is None:
         return np.zeros(3, dtype=np.float64), 0
@@ -46,7 +49,7 @@ def compute_object_pose(
     inside = seg_mask[idx] != 0
     n_in = int(inside.sum())
     if n_in < MIN_POINTS:
-        return np.zeros(3, dtype=np.float64), n_in
+        return np.zeros(3, dtype=np.float64), 0  # 0 = "no fresh estimate"
 
     pts_cam = pc_xyz[:n_valid][inside]              # (n_in, 3)
     centroid_cam = pts_cam.mean(axis=0)             # (3,)
