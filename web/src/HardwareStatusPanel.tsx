@@ -17,7 +17,8 @@ type Props = { stream: StreamState };
 
 export function HardwareStatusPanel({ stream }: Props) {
   const robot = stream.meta?.robot;
-  const visible = robot?.source === "hardware";
+  // Live joint angles + EE pose are useful in sim too.
+  const visible = robot?.source === "hardware" || robot?.source === "sim";
 
   // Throttled snapshot of EE pose + joint angles (5 Hz) so we don't re-render
   // on every transform tick.

@@ -78,7 +78,7 @@ export function DiagnosticsTab({ stream }: Props) {
         </div>
       )}
 
-      {robot?.source === "hardware" && (
+      {(robot?.source === "hardware" || robot?.source === "sim") && (
         <details className="row" style={{ paddingLeft: 0 }}>
           <summary className="label" style={{ cursor: "pointer" }}>
             Fault history ({stream.robotStatus?.fault_history?.length ?? 0})
@@ -127,7 +127,7 @@ export function DiagnosticsTab({ stream }: Props) {
           <span>source</span>
           <span className="kv-val">{robot?.source ?? "—"}</span>
         </div>
-        {robot?.source === "hardware" && (
+        {(robot?.source === "hardware" || robot?.source === "sim") && (
           <>
             <div className="kv mono" style={{ fontSize: "0.85em" }}>
               <span>phase</span>

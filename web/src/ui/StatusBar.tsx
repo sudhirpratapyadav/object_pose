@@ -123,9 +123,13 @@ export function StatusBar({ stream }: Props) {
           <>
             <span
               className={`status-pill ${transportAlive === false ? "status-pill-bad" : "status-pill-ok"}`}
-              title="Kortex link to the robot"
+              title={robotSrc === "hardware"
+                ? "Kortex link to the robot"
+                : "Sim transport (MuJoCo physics + bridge)"}
             >
-              <span className="status-pill-key">kortex</span>
+              <span className="status-pill-key">
+                {robotSrc === "hardware" ? "kortex" : "sim"}
+              </span>
               <span className="status-pill-val mono">
                 {transportAlive === false ? "offline" : "ok"}
               </span>
