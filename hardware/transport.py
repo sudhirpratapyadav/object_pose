@@ -75,6 +75,11 @@ def transport_process(
     shm_hz,                # mp.Array('d', 1) — measured loop rate
     shm_phase,             # mp.Value('B') — PHASE_*
     shm_fault_msg,         # mp.Array('c', 256) — short fault string
+    # Per-policy home override. When *_valid=1, the next SST goes to
+    # this pose instead of the universal HOME_DEG. Cleared by the
+    # transport after use.
+    shm_home_override=None,        # mp.Array('d', 7) — joint angles (deg)
+    shm_home_override_valid=None,  # mp.Value('B')
     log_q=None,            # mp.Queue — log relay for the browser
 ):
     """Main transport loop. Run as ``mp.Process(target=transport_process)``."""
@@ -142,8 +147,18 @@ def transport_process(
             if swap_request_ev.is_set():
                 with swap_target_mode.get_lock():
                     target_mode = int(swap_target_mode.value)
+                # Check the per-policy home override; consume it if valid.
+                home_deg = HOME_DEG
+                if (shm_home_override_valid is not None
+                        and shm_home_override is not None):
+                    with shm_home_override_valid.get_lock():
+                        if int(shm_home_override_valid.value) != 0:
+                            with shm_home_override.get_lock():
+                                home_deg = _np_arr(shm_home_override)[:7].copy()
+                            shm_home_override_valid.value = 0
+                            log.info(f"SST: using policy home_deg={home_deg}")
                 _do_swap(hw, log, target_mode, set_phase, set_fault,
-                         in_low_level)
+                         in_low_level, home_deg=home_deg)
                 # After swap we always end up at home in the target mode.
                 # If target is torque, we're now in low-level.
                 in_low_level = (target_mode == CMD_MODE_TORQUE)
@@ -275,19 +290,22 @@ def _publish_state(shm_q, shm_dq, shm_state_seq,
 
 def _do_swap(hw: KinovaHardware, log,
              target_mode: int, set_phase, set_fault,
-             in_low_level: bool) -> None:
+             in_low_level: bool,
+             home_deg: np.ndarray = HOME_DEG) -> None:
     """The Safe State Transition.
 
     Always goes through home pose. Steps:
       1. If currently in low-level: turn off torque mode, switch to
          high-level.
       2. Clear faults + wait_until_ready.
-      3. JointMove HOME.
+      3. JointMove to ``home_deg`` (defaults to the universal HOME_DEG;
+         the policy dispatcher overrides this with the policy's trained
+         home when a policy is engaging).
       4. If target is torque mode: switch to low_level + torque on.
          Otherwise (idle / position): stay in high-level.
     """
     set_phase(4)  # PHASE_SWAPPING
-    log.info(f"SST start → target={target_mode}")
+    log.info(f"SST start → target={target_mode}, home={np.round(home_deg, 1)}")
     try:
         if in_low_level:
             hw.set_torque_mode(False)
@@ -299,7 +317,7 @@ def _do_swap(hw: KinovaHardware, log,
         if not hw.wait_until_ready(timeout=10.0):
             log.warning("SST: not ready before homing")
         log.info("SST: homing…")
-        if not hw.go_to_joints(HOME_DEG):
+        if not hw.go_to_joints(home_deg):
             log.error("SST: JointMove home failed")
             set_fault("home failed during SST")
             return

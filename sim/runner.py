@@ -110,6 +110,8 @@ def sim_worker(
     shm_hz=None,
     shm_phase=None,
     shm_fault_msg=None,
+    shm_home_override=None,
+    shm_home_override_valid=None,
 ):
     """Sim process target. Owns the MjModel, MjData, Renderer, and viewer.
 
@@ -234,8 +236,18 @@ def sim_worker(
                         target_mode = int(swap_target_mode.value)
                     _set_phase(shm_phase, PHASE_SWAPPING)
                     # Always pass through home: snap arm joints to HOME, zero vel.
-                    home_rad = kinova_deg_to_rad(
-                        np.asarray(HOME_DEG, dtype=np.float64))
+                    # If a per-policy home override is set, use it instead.
+                    home_deg = np.asarray(HOME_DEG, dtype=np.float64)
+                    if (shm_home_override_valid is not None
+                            and shm_home_override is not None):
+                        with shm_home_override_valid.get_lock():
+                            if int(shm_home_override_valid.value) != 0:
+                                with shm_home_override.get_lock():
+                                    home_deg = _np_arr(shm_home_override)[:7].copy()
+                                shm_home_override_valid.value = 0
+                                print(f"[sim] SST: using policy home_deg={home_deg.round(1)}",
+                                      flush=True)
+                    home_rad = kinova_deg_to_rad(home_deg)
                     # Smooth ramp would be nicer but a single-step snap keeps the
                     # protocol simple. Real hardware takes ~8 s for this; we just
                     # sleep briefly so the UI status pill is visible.

@@ -1158,6 +1158,11 @@ async def main_async(args) -> None:
         shm_policy_hz         = mp.Array("d", 1, lock=True)
         shm_policy_last_action = mp.Array("d", 7, lock=True)
         shm_policy_status     = mp.Array("B", 1, lock=True)   # 0=waiting,1=running,2=success
+        # Per-policy home override. When valid=1, the next SST will
+        # JointMove to this pose instead of the universal HOME_DEG.
+        # Cleared by the transport after use.
+        shm_home_override     = mp.Array("d", 7, lock=True)   # joint angles (deg)
+        shm_home_override_valid = mp.Value("B", 0, lock=True)
 
         # Policy defaults loaded from YAML.
         from policies.configs import load_configs as load_pol_cfg
@@ -1179,6 +1184,8 @@ async def main_async(args) -> None:
             shm_policy_hz=shm_policy_hz,
             shm_policy_last_action=shm_policy_last_action,
             shm_policy_status=shm_policy_status,
+            shm_home_override=shm_home_override,
+            shm_home_override_valid=shm_home_override_valid,
             pol_configs=pol_configs,
             # Async mutex so concurrent UI clicks (Play during Stop, etc.)
             # don't race. Each policy handler grabs it for its full
@@ -1219,6 +1226,8 @@ async def main_async(args) -> None:
                     "swap_done_ev": swap_done_ev,
                     "shm_hz": shm_hz, "shm_phase": shm_phase,
                     "shm_fault_msg": shm_fault_msg,
+                    "shm_home_override": shm_home_override,
+                    "shm_home_override_valid": shm_home_override_valid,
                     "log_q": log_q,
                 },
                 daemon=True,
@@ -1265,6 +1274,8 @@ async def main_async(args) -> None:
                     "swap_done_ev": swap_done_ev,
                     "shm_hz": shm_hz, "shm_phase": shm_phase,
                     "shm_fault_msg": shm_fault_msg,
+                    "shm_home_override": shm_home_override,
+                    "shm_home_override_valid": shm_home_override_valid,
                 },
                 daemon=True,
             )
@@ -1550,6 +1561,25 @@ async def main_async(args) -> None:
         from controllers.ee_pose import _quat_xyzw_from_matrix
         return pos, _quat_xyzw_from_matrix(R)
 
+    def _set_home_override(home_deg: list[float] | None) -> None:
+        """Tell the next SST to JointMove to this pose instead of the
+        universal HOME_DEG. Pass None to clear.
+        """
+        if hw_state.get("shm_home_override") is None:
+            return
+        if home_deg is None:
+            with hw_state["shm_home_override_valid"].get_lock():
+                hw_state["shm_home_override_valid"].value = 0
+            return
+        if len(home_deg) != 7:
+            return
+        with hw_state["shm_home_override"].get_lock():
+            arr = np.frombuffer(
+                hw_state["shm_home_override"].get_obj(), dtype=np.float64)
+            arr[:7] = home_deg
+        with hw_state["shm_home_override_valid"].get_lock():
+            hw_state["shm_home_override_valid"].value = 1
+
     def _seed_qtarget_to_current() -> None:
         """Write the current FK pose into shm_qtarget so the ee_pose
         controller holds the arm exactly where it is now."""
@@ -1717,14 +1747,32 @@ async def main_async(args) -> None:
                 return  # already running
             from policies import POLICIES
             info, _ = POLICIES[name]
+            cfg = hw_state["pol_configs"].get(name, {})
 
             # Overlay gains BEFORE the controller swap so the new
             # controller boots with the right gains.
             _overlay_policy_gains(name)
 
+            # Tell the next SST to use the policy's trained home pose
+            # instead of the universal HOME_DEG. The transport reads +
+            # consumes the override on the next swap. The hot-swap
+            # below triggers exactly that swap.
+            policy_home = cfg.get("home_deg")
+            if policy_home is not None and len(policy_home) == 7:
+                _set_home_override(list(policy_home))
+
             # If the required controller isn't running, hot-swap to it.
+            # The SST drives to the policy's home (if we set one above).
             if hw_state["ctrl_name"] != info.controller:
                 await on_set_controller(info.controller)
+            else:
+                # Same controller already running; we still want to home
+                # to the policy's pose. Bounce through idle to force a
+                # fresh SST. (Two swaps: idle, then policy controller.)
+                if policy_home is not None and len(policy_home) == 7:
+                    await on_set_controller("idle")
+                    _set_home_override(list(policy_home))
+                    await on_set_controller(info.controller)
 
             ok = await _spawn_policy(name)
             if ok:
@@ -1747,7 +1795,9 @@ async def main_async(args) -> None:
             _restore_user_gains()
             hw_state["policy_engaged_once"] = False  # reset to idle state
             hw_state["policy_error"] = ""
-            # Drive home via the SST: swap to idle so the arm parks safely.
+            # Stop drives to the universal HOME_DEG (clear any leftover
+            # policy home override).
+            _set_home_override(None)
             await on_set_controller("idle")
 
     async def on_pause_policy() -> None:
@@ -1777,8 +1827,8 @@ async def main_async(args) -> None:
             await _broadcast_controller_state()
 
     async def on_reset_policy() -> None:
-        """Drive home via the SST, then sit paused. Selection is kept.
-        Only meaningful after a previous Play.
+        """Drive home (the policy's home) via the SST, then sit paused.
+        Selection is kept. Only meaningful after a previous Play.
         """
         if args.robot_source not in ("hardware", "sim"):
             return
@@ -1790,17 +1840,22 @@ async def main_async(args) -> None:
             # during the swap.
             if hw_state["policy_proc"] is not None:
                 await _kill_policy()
-            # Bounce through idle so the SST drives home. Then re-engage the
-            # required controller, but DON'T re-spawn the policy.
             from policies import POLICIES
             info, _ = POLICIES[name]
+            cfg = hw_state["pol_configs"].get(name, {})
+            # Idle bounce: drive to universal HOME (sanity), then back to
+            # ee_pose at the policy's home so we end up exactly there.
+            _set_home_override(None)
             await on_set_controller("idle")
-            # Re-overlay gains and bring up the controller again.
+            policy_home = cfg.get("home_deg")
+            if policy_home is not None and len(policy_home) == 7:
+                _set_home_override(list(policy_home))
             _overlay_policy_gains(name)
             await on_set_controller(info.controller)
             # Seed qtarget to current (home) FK so the arm holds at home.
             _seed_qtarget_to_current()
-            print(f"[pol] reset done — paused at home, selection='{name}'", flush=True)
+            print(f"[pol] reset done — paused at policy home, "
+                  f"selection='{name}'", flush=True)
             await _broadcast_controller_state()
 
     async def on_save_policy_configs() -> None:
@@ -1879,6 +1934,8 @@ async def main_async(args) -> None:
                 "shm_hz":      hw_state["shm_hz"],
                 "shm_phase":   hw_state["shm_phase"],
                 "shm_fault_msg": hw_state["shm_fault_msg"],
+                "shm_home_override": hw_state["shm_home_override"],
+                "shm_home_override_valid": hw_state["shm_home_override_valid"],
                 "log_q":       hw_state.get("log_q"),
             },
             daemon=True,
